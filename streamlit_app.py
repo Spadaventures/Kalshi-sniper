@@ -8,7 +8,9 @@ from datetime import datetime
 from openai import OpenAI
 
 # ============ CONFIG ============
+openai.api_key = st.secrets["OPENAI_API_KEY"]
 MODEL_NAME = "gpt-4o"
+WEATHER_API_KEY = st.secrets["WEATHER_API_KEY"]
 
 # ============ STREAMLIT UI ============
 st.set_page_config(page_title="Kalshi Sniper", layout="wide", initial_sidebar_state="collapsed")
@@ -33,7 +35,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📸 Kalshi Screenshot Analyzer (iOS Optimized)")
-st.markdown("Upload a **screenshot of a Kalshi question with its YES/NO prices**. I’ll extract it and tell you what to bet on.")
+st.markdown("Upload a **screenshot of a Kalshi question with its YES/NO prices**. I’ll extract it and tell you the most likely outcome.")
 
 uploaded_file = st.file_uploader("Upload Kalshi Screenshot", type=["png", "jpg", "jpeg"])
 run_button = st.button("📈 Run AI Analysis")
@@ -45,8 +47,7 @@ def extract_text_from_image(image_bytes):
 
 def get_weather_forecast(city):
     try:
-        api_key = st.secrets["OPENWEATHER_API_KEY"]
-        url = f"https://api.openweathermap.org/data/2.5/forecast?q={city}&appid={api_key}&units=imperial"
+        url = f"https://api.openweathermap.org/data/2.5/forecast?q={city}&appid={WEATHER_API_KEY}&units=imperial"
         response = requests.get(url).json()
 
         temps = [entry['main']['temp'] for entry in response['list'][:8]]
@@ -63,56 +64,41 @@ def get_weather_forecast(city):
         }.get(city, 78)
 
         temp_deviation = max_temp - avg_temp
-        confidence_hint = "High" if abs(temp_deviation) >= 5 or total_rain > 2 else "Medium"
+        success_probability = 50 + min(max(temp_deviation * 2, -20), 20) + (5 if total_rain > 2 else 0)
+        success_probability = min(max(success_probability, 0), 100)
 
-        return {
-            "forecast_high": max_temp,
-            "average_high": avg_temp,
-            "deviation": temp_deviation,
-            "condition": condition,
-            "rain": total_rain,
-            "confidence": confidence_hint
-        }
+        return f"Forecast high: {max_temp}°F (avg {avg_temp}°F, Δ {temp_deviation:+.1f}), Condition: {condition}, Rain: {total_rain}mm\nEstimated success chance: {success_probability:.1f}%", success_probability
     except:
-        return None
+        return "Weather forecast unavailable", 0
 
 def format_prompt(text, weather_data=None):
-    weather_summary = ""
-    if weather_data:
-        weather_summary = (
-            f"Forecast high: {weather_data['forecast_high']}°F (avg {weather_data['average_high']}°F, Δ {weather_data['deviation']:+.1f})\n"
-            f"Condition: {weather_data['condition']}, Rain: {weather_data['rain']}mm\n"
-            f"Est. Confidence from forecast: {weather_data['confidence']}"
-        )
-
-    return f"""You are a high-accuracy prediction market AI.
+    weather_note = f"\n\nWeather forecast info:\n{weather_data}" if weather_data else ""
+    return f"""You are a high-accuracy AI prediction market analyst.
 
 Extracted Kalshi Market Text:
-{text}
+{text}{weather_note}
 
-{weather_summary}
-
-Instructions:
-- Identify YES/NO prices.
-- Use weather forecast and seasonal norms to determine which outcome is underpriced.
-- Recommend which option to bet on.
-- Justify your reasoning clearly.
-- Rate your confidence as High / Medium / Low.
+1. Identify the market question and the YES/NO prices.
+2. Estimate which outcome is underpriced.
+3. Justify the decision with evidence (like weather forecast or seasonal norms).
+4. Output your final recommendation: YES or NO and why.
+5. Output estimated chance of success as a percent.
 """
 
 def analyze_screenshot_text(text):
     weather_info = None
-    city_found = None
-    for city in ["NYC", "New York", "Miami", "Denver", "Chicago", "Austin", "LA", "Los Angeles"]:
-        if city.lower() in text.lower():
-            city_found = city
-            break
+    success_chance = 0
+    if "rain" in text.lower() or "temperature" in text.lower():
+        for city in ["NYC", "New York", "Miami", "Denver", "Chicago", "Austin", "LA", "Los Angeles"]:
+            if city.lower() in text.lower():
+                weather_info, success_chance = get_weather_forecast(city)
+                break
 
-    if city_found:
-        weather_info = get_weather_forecast(city_found)
+    if success_chance < 60:
+        return f"❌ Skipping. Estimated chance of success is too low: {success_chance:.1f}%"
 
     prompt = format_prompt(text, weather_info)
-    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    client = OpenAI(api_key=openai.api_key)
     response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
@@ -120,7 +106,7 @@ def analyze_screenshot_text(text):
             {"role": "user", "content": prompt}
         ],
         temperature=0.3,
-        max_tokens=700
+        max_tokens=600
     )
     return response.choices[0].message.content.strip()
 
@@ -129,5 +115,4 @@ if run_button and uploaded_file:
     image_text = extract_text_from_image(uploaded_file.read())
     with st.spinner("Analyzing screenshot..."):
         result = analyze_screenshot_text(image_text)
-        st.markdown(f"""### 📊 Result:\n\n{result}\n\n---""")
-        
+        st.markdown(f"### 📊 Result:\n\n{result}\n\n---")
