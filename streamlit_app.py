@@ -1,5 +1,5 @@
+
 import streamlit as st
-import openai
 import requests
 from PIL import Image
 import pytesseract
@@ -8,8 +8,8 @@ from datetime import datetime
 from openai import OpenAI
 
 # ============ CONFIG ============
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 MODEL_NAME = "gpt-4o"
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 WEATHER_API_KEY = st.secrets["WEATHER_API_KEY"]
 
 # ============ STREAMLIT UI ============
@@ -70,28 +70,24 @@ def format_prompt(text, weather_data=None):
     weather_note = f"\n\nWeather forecast info:\n{weather_data}" if weather_data else ""
     return f"""You are a high-accuracy AI prediction market analyst.
 
-Kalshi Market Question:
+Extracted Kalshi Market Text:
 {text}{weather_note}
 
-Instructions:
-1. Use the weather forecast to estimate today's high temperature.
-2. Choose the single **most likely correct YES range**.
-3. Justify your choice in 1–2 sentences.
-4. Say exactly what to bet on, like this:
-✅ BET: "75° to 76°" — Yes
-5. Rate confidence: High / Medium / Low.
+1. Identify the market question and the YES/NO prices.
+2. Estimate which outcome is underpriced.
+3. Justify the decision with evidence (like weather forecast or seasonal norms).
+4. Rate confidence: High / Medium / Low.
 """
+
 
 def analyze_screenshot_text(text):
     weather_info = None
-    cities = {
-        "nyc": "New York", "new york": "New York", "la": "Los Angeles", "los angeles": "Los Angeles",
-        "miami": "Miami", "denver": "Denver", "chicago": "Chicago", "austin": "Austin"
-    }
-    for key, value in cities.items():
-        if key in text.lower():
-            weather_info = get_weather_forecast(value)
-            break
+    if "rain" in text.lower() or "temperature" in text.lower():
+        for city in ["NYC", "New York", "Miami", "Denver", "Chicago", "Austin", "LA", "Los Angeles"]:
+            if city.lower() in text.lower():
+                weather_info = get_weather_forecast(city)
+                break
+
     prompt = format_prompt(text, weather_info)
     response = client.chat.completions.create(
         model=MODEL_NAME,
@@ -104,9 +100,9 @@ def analyze_screenshot_text(text):
     )
     return response.choices[0].message.content.strip()
 
-# ============ ANALYSIS ==========
+# ============ ANALYSIS ============
 if run_button and uploaded_file:
     image_text = extract_text_from_image(uploaded_file.read())
     with st.spinner("Analyzing screenshot..."):
         result = analyze_screenshot_text(image_text)
-        st.markdown("### 📊 Result:\n\n{}\n\n---".format(result))
+        st.markdown(f"### 🧠 Result:\n\n{result}\n\n---")
