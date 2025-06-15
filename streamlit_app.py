@@ -10,7 +10,7 @@ from openai import OpenAI
 # ============ CONFIG ============
 openai.api_key = st.secrets["OPENAI_API_KEY"]
 MODEL_NAME = "gpt-4o"
-WEATHER_API_KEY = st.secrets["WEATHER_API_KEY"]
+WEATHER_API_KEY = "f5b0dd8ef5f71ac70e54a5d51eb85a9d"
 
 # ============ STREAMLIT UI ============
 st.set_page_config(page_title="Kalshi Sniper", layout="wide", initial_sidebar_state="collapsed")
@@ -57,6 +57,7 @@ def get_weather_forecast(city):
         condition = response['list'][0]['weather'][0]['description']
 
         today = datetime.now()
+        month = today.strftime('%B')
         avg_temp = {
             "NYC": 76, "Miami": 88, "Denver": 79,
             "Chicago": 75, "Austin": 89, "LA": 77,
@@ -64,10 +65,11 @@ def get_weather_forecast(city):
         }.get(city, 78)
 
         temp_deviation = max_temp - avg_temp
-        success_probability = 50 + min(max(temp_deviation * 2, -20), 20) + (5 if total_rain > 2 else 0)
-        success_probability = min(max(success_probability, 0), 100)
 
-        return f"Forecast high: {max_temp}°F (avg {avg_temp}°F, Δ {temp_deviation:+.1f}), Condition: {condition}, Rain: {total_rain}mm\nEstimated success chance: {success_probability:.1f}%", success_probability
+        base_conf = 50 + temp_deviation * 2 + (5 if total_rain > 1 else 0)
+        estimated_chance = min(max(int(base_conf), 10), 95)
+
+        return f"Forecast high: {max_temp}°F (avg {avg_temp}°F, Δ {temp_deviation:+.1f}), Condition: {condition}, Rain: {total_rain}mm\nEst. Success Chance: {estimated_chance}%", estimated_chance
     except:
         return "Weather forecast unavailable", 0
 
@@ -81,21 +83,21 @@ Extracted Kalshi Market Text:
 1. Identify the market question and the YES/NO prices.
 2. Estimate which outcome is underpriced.
 3. Justify the decision with evidence (like weather forecast or seasonal norms).
-4. Output your final recommendation: YES or NO and why.
-5. Output estimated chance of success as a percent.
+4. Provide a percentage chance of success based on weather and seasonal reasoning.
+5. Clearly state what to bet on.
 """
 
 def analyze_screenshot_text(text):
     weather_info = None
-    success_chance = 0
+    estimated_chance = 0
     if "rain" in text.lower() or "temperature" in text.lower():
         for city in ["NYC", "New York", "Miami", "Denver", "Chicago", "Austin", "LA", "Los Angeles"]:
             if city.lower() in text.lower():
-                weather_info, success_chance = get_weather_forecast(city)
+                weather_info, estimated_chance = get_weather_forecast(city)
                 break
 
-    if success_chance < 60:
-        return f"❌ Skipping. Estimated chance of success is too low: {success_chance:.1f}%"
+    if estimated_chance < 40:
+        return f"⚠️ Low confidence (Est. Chance: {estimated_chance}%) — bet at your own risk.\n\n{weather_info}"
 
     prompt = format_prompt(text, weather_info)
     client = OpenAI(api_key=openai.api_key)
