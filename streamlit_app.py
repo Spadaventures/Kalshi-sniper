@@ -130,3 +130,4 @@ if run_button and uploaded_file:
     with st.spinner("Analyzing screenshot..."):
         result = analyze_screenshot_text(image_text)
         st.markdown(f"""### 📊 Result:\n\n{result}\n\n---""")
+        
