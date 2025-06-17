@@ -9,8 +9,10 @@ from openai import OpenAI
 import os
 import csv
 import json
-import threading
 import websocket
+
+# Must be the first Streamlit command
+st.set_page_config(page_title="Kalshi Sniper", layout="wide", initial_sidebar_state="collapsed")
 
 # ============ CONFIG ============
 openai.api_key = st.secrets["OPENAI_API_KEY"]
@@ -21,40 +23,27 @@ OPENWEATHER_API_KEY = st.secrets["WEATHER_API_KEY"]
 KALSHI_KEY_ID = st.secrets["KALSHI_KEY_ID"]
 KALSHI_PRIVATE_KEY = st.secrets["KALSHI_PRIVATE_KEY"]
 
-# ============ REAL-TIME KALSHI WEBSOCKET ============
-st.info("Connecting to Kalshi WebSocket for live weather markets...")
-
-KALSHI_WS_URL = "wss://trade-api.kalshi.com/ws/markets"
-latest_market = st.empty()
-
-def on_message(ws, message):
-    try:
-        data = json.loads(message)
-        for m in data.get("markets", []):
-            if "temperature" in m["ticker"].lower():
-                latest_market.markdown(f"**Live Market:** {m['ticker']} — Yes: {m.get('yes_price')} | No: {m.get('no_price')}")
-    except Exception as e:
-        latest_market.markdown(f"WebSocket Message Error: {e}")
-
-def on_error(ws, error):
-    latest_market.markdown(f"WebSocket Error: {error}")
-
-def on_close(ws):
-    latest_market.markdown("WebSocket connection closed")
-
-def start_ws():
-    ws = websocket.WebSocketApp(
-        KALSHI_WS_URL,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-    ws.run_forever()
-
-threading.Thread(target=start_ws, daemon=True).start()
-
 # ============ STREAMLIT UI ============
-st.set_page_config(page_title="Kalshi Sniper", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""
+    <style>
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 1rem;
+            padding-left: 1rem;
+            padding-right: 1rem;
+            max-width: 500px;
+            margin: auto;
+        }
+        .stTextInput > div > div > input, .stTextArea > div > textarea {
+            font-size: 16px;
+        }
+        .stButton > button {
+            width: 100%;
+            font-size: 18px;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
 st.title("Kalshi Screenshot Analyzer (iOS Optimized)")
 st.markdown("Upload a screenshot of a Kalshi question with its YES/NO prices. I’ll extract it and tell you the most likely outcome.")
 
@@ -121,7 +110,7 @@ def get_weather_forecast(city):
         adjustment = min(1.0, max(0.5, 1 - (hours_to_event / 24)))
         adjusted_prob = raw_prob * adjustment
 
-        return f"Forecast high: {max_temp}°F (hist avg {avg_temp:.1f}°F, Δ {temp_deviation:+.1f}), Condition: {condition}, API spread: {spread:.1f}°\nEst. Success Rate: {adjusted_prob:.1f}%", adjusted_prob
+        return f"Forecast high: {max_temp} F (hist avg {avg_temp:.1f} F, Delta {temp_deviation:+.1f}), Condition: {condition}, API spread: {spread:.1f} \nEst. Success Rate: {adjusted_prob:.1f}%", adjusted_prob
 
     except Exception as e:
         return f"Weather forecast unavailable ({str(e)})", 0
@@ -135,21 +124,18 @@ def extract_city(text):
 
 def format_prompt(text, weather_data=None):
     weather_note = f"\n\nWeather forecast info:\n{weather_data}" if weather_data else ""
-    return f'''
-You are a high-accuracy AI prediction market analyst.
-
-Extracted Kalshi Market Text:
-{text}{weather_note}
-
-1. Identify the market question and the YES/NO prices.
-2. Estimate which outcome is underpriced.
-3. Justify the decision with evidence (like weather forecast or seasonal norms).
-4. Give an estimated percentage chance the prediction will be correct.
-5. Respond in the format:
-- Prediction: [Clear YES/NO range choice]
-- Estimated Probability: [xx%]
-- Reasoning: [Why this outcome is likely]
-'''
+    return (
+        "You are a high-accuracy AI prediction market analyst.\n\n"
+        f"Extracted Kalshi Market Text:\n{text}{weather_note}\n\n"
+        "1. Identify the market question and the YES/NO prices.\n"
+        "2. Estimate which outcome is underpriced.\n"
+        "3. Justify the decision with evidence (like weather forecast or seasonal norms).\n"
+        "4. Give an estimated percentage chance the prediction will be correct.\n"
+        "5. Respond in the format:\n"
+        "- Prediction: [Clear YES/NO range choice]\n"
+        "- Estimated Probability: [xx%]\n"
+        "- Reasoning: [Why this outcome is likely]"
+    )
 
 def analyze_screenshot_text(text):
     city = extract_city(text)
