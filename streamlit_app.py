@@ -125,13 +125,23 @@ def get_weather_forecast(city):
 
         return f"Forecast high: {max_temp}°F (hist avg {avg_temp:.1f}°F, Δ {temp_deviation:+.1f}), Condition: {condition}, API spread: {spread:.1f}°\nEst. Success Rate: {adjusted_prob:.1f}%", adjusted_prob
     except Exception as e:
+        st.error(f"🌩️ Weather API error: {str(e)}")
         return f"Weather forecast unavailable ({str(e)})", 0
 
 def extract_city(text):
-    city_keywords = ["NYC", "New York", "Miami", "Denver", "Chicago", "Austin", "LA", "Los Angeles"]
-    for city in city_keywords:
-        if city.lower() in text.lower():
-            return city
+    city_keywords = {
+        "la": "Los Angeles",
+        "los angeles": "Los Angeles",
+        "nyc": "New York",
+        "new york": "New York",
+        "chicago": "Chicago",
+        "denver": "Denver",
+        "miami": "Miami",
+        "austin": "Austin"
+    }
+    for key, value in city_keywords.items():
+        if key in text.lower():
+            return value
     return ""
 
 def format_prompt(text, weather_data=None, order_book_data=None):
