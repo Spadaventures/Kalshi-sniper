@@ -18,10 +18,9 @@ TOMORROWIO_API_KEY = st.secrets["TOMORROWIO_API_KEY"]
 OPENWEATHER_API_KEY = st.secrets["WEATHER_API_KEY"]
 KALSHI_API_KEY = st.secrets["KALSHI_API_KEY"]
 KALSHI_KEY_ID = st.secrets["KALSHI_KEY_ID"]
-KALSHI_PRIVATE_KEY = st.secrets["KALSHI_PRIVATE_KEY"]
 
+# ============ STREAMLIT UI ============
 st.set_page_config(page_title="Kalshi Sniper", layout="wide", initial_sidebar_state="collapsed")
-
 st.markdown("""
     <style>
         .block-container {
@@ -42,11 +41,19 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("📸 Kalshi Screenshot Analyzer (iOS Optimized)")
-st.markdown("Upload a **screenshot of a Kalshi question with its YES/NO prices**. I’ll extract it and tell you the most likely outcome.")
+st.title("ð¸ Kalshi Screenshot Analyzer (iOS Optimized)")
+st.markdown("Upload a **screenshot of a Kalshi question with its YES/NO prices**. Iâll extract it and tell you the most likely outcome.")
 
 uploaded_file = st.file_uploader("Upload Kalshi Screenshot", type=["png", "jpg", "jpeg"])
-run_button = st.button("📈 Run AI Analysis")
+run_button = st.button("ð Run AI Analysis")
+
+# ============ HELPER FUNCTIONS ============
+def extract_text_from_image(image_bytes):
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        return pytesseract.image_to_string(image)
+    except Exception as e:
+        return f"Error reading image: {e}"
 
 @st.cache_data
 def load_historical_temps():
@@ -57,13 +64,6 @@ def load_historical_temps():
         return []
 
 historical_data = load_historical_temps()
-
-def extract_text_from_image(image_bytes):
-    try:
-        image = Image.open(io.BytesIO(image_bytes))
-        return pytesseract.image_to_string(image)
-    except Exception as e:
-        return f"Error reading image: {e}"
 
 def get_historical_temp(city):
     try:
@@ -94,8 +94,8 @@ def get_weather_forecast(city):
     try:
         owm_url = f"https://api.openweathermap.org/data/2.5/forecast?q={city}&appid={OPENWEATHER_API_KEY}&units=imperial"
         owm_response = requests.get(owm_url).json()
-        owm_temps = [entry['main']['temp'] for entry in owm_response['list'][:8]]
-        owm_max = max(owm_temps)
+        owm_temps = [entry['main']['temp'] for entry in owm_response.get('list', [])[:8]]
+        owm_max = max(owm_temps) if owm_temps else None
 
         wapi_url = f"http://api.weatherapi.com/v1/forecast.json?key={WEATHERAPI_KEY}&q={city}&days=1"
         wapi_response = requests.get(wapi_url).json()
@@ -105,11 +105,14 @@ def get_weather_forecast(city):
         t_response = requests.get(t_url).json()
         t_max = t_response['timelines']['daily'][0]['values']['temperatureMax']
 
-        forecasts = [owm_max, wapi_max, t_max]
+        forecasts = [t for t in [owm_max, wapi_max, t_max] if t is not None]
+        if not forecasts:
+            raise Exception("No valid temperature forecasts.")
+
         max_temp = round(sum(forecasts) / len(forecasts), 1)
         spread = max(forecasts) - min(forecasts)
 
-        condition = owm_response['list'][0]['weather'][0]['description']
+        condition = owm_response['list'][0]['weather'][0]['description'] if 'list' in owm_response and owm_response['list'] else "Unknown"
         avg_temp = get_historical_temp(city) or 78
         temp_deviation = max_temp - avg_temp
 
@@ -120,28 +123,17 @@ def get_weather_forecast(city):
         adjustment = min(1.0, max(0.5, 1 - (hours_to_event / 24)))
         adjusted_prob = raw_prob * adjustment
 
-        debug = f"Forecasts from APIs: {owm_max}, {wapi_max}, {t_max} | Spread: {spread:.2f} | Temp Δ: {temp_deviation:.2f} | Raw prob: {raw_prob:.1f}% | Final adjusted: {adjusted_prob:.1f}%"
-        st.code(debug, language='text')
+        return f"Forecast high: {max_temp}Â°F (hist avg {avg_temp:.1f}Â°F, Î {temp_deviation:+.1f}), Condition: {condition}, API spread: {spread:.1f}Â°
+Est. Success Rate: {adjusted_prob:.1f}%", adjusted_prob
 
-        return f"Forecast high: {max_temp}°F (hist avg {avg_temp:.1f}°F, Δ {temp_deviation:+.1f}), Condition: {condition}, API spread: {spread:.1f}°\nEst. Success Rate: {adjusted_prob:.1f}%", adjusted_prob
     except Exception as e:
-        st.error(f"🌩️ Weather API error: {str(e)}")
-        return f"Weather forecast unavailable ({str(e)})", 0
+        return f"ð©ï¸ Weather API error: {str(e)}", 0
 
 def extract_city(text):
-    city_keywords = {
-        "la": "Los Angeles",
-        "los angeles": "Los Angeles",
-        "nyc": "New York",
-        "new york": "New York",
-        "chicago": "Chicago",
-        "denver": "Denver",
-        "miami": "Miami",
-        "austin": "Austin"
-    }
-    for key, value in city_keywords.items():
-        if key in text.lower():
-            return value
+    city_keywords = ["NYC", "New York", "Miami", "Denver", "Chicago", "Austin", "LA", "Los Angeles"]
+    for city in city_keywords:
+        if city.lower() in text.lower():
+            return city
     return ""
 
 def format_prompt(text, weather_data=None, order_book_data=None):
@@ -157,9 +149,9 @@ Extracted Kalshi Market Text:
 3. Justify the decision with evidence (like weather forecast or seasonal norms).
 4. Give an estimated percentage chance the prediction will be correct.
 5. Respond in the format:
-- 🔮 **Prediction**: [Clear YES/NO range choice]
-- 📈 **Estimated Probability**: [xx%]
-- 🧠 **Reasoning**: [Why this outcome is likely]"""
+- ð® **Prediction**: [Clear YES/NO range choice]
+- ð **Estimated Probability**: [xx%]
+- ð§  **Reasoning**: [Why this outcome is likely]"""
 
 def analyze_screenshot_text(text):
     city = extract_city(text)
@@ -169,6 +161,10 @@ def analyze_screenshot_text(text):
 
     if city:
         weather_info, confidence_pct = get_weather_forecast(city)
+
+    if confidence_pct < 40:
+        st.info(f"â Skipping. Estimated chance of success is too low: {confidence_pct:.1f}%\nMarket: {text[:100]}")
+        return f"â Skipping. Estimated chance of success is too low: {confidence_pct:.1f}%"
 
     prompt = format_prompt(text, weather_info, order_book_data)
     client = OpenAI(api_key=openai.api_key)
@@ -183,11 +179,14 @@ def analyze_screenshot_text(text):
     )
     result = response.choices[0].message.content.strip()
 
-    st.markdown(f"### 📊 Result:\n\n{result}\n\n---")
+    if confidence_pct >= 80:
+        st.toast("ð¨ High-probability opportunity detected!", icon="â¡")
 
     return result
 
+# ============ ANALYSIS ============
 if run_button and uploaded_file:
     image_text = extract_text_from_image(uploaded_file.read())
     with st.spinner("Analyzing screenshot..."):
-        analyze_screenshot_text(image_text)
+        result = analyze_screenshot_text(image_text)
+        st.markdown(f"### ð Result:\n\n{result}\n\n---")
