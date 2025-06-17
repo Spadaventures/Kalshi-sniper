@@ -43,3 +43,5 @@ st.markdown("""
 
 st.title("📸 Kalshi Screenshot Analyzer (iOS Optimized)")
 st.markdown("Upload a **screenshot of a Kalshi question with its YES/NO prices**. I’ll extract it and tell you the most likely outcome.")
+uploaded_file = st.file_uploader("Upload Kalshi Screenshot", type=["png", "jpg", "jpeg"])
+
