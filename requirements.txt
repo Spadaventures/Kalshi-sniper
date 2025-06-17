@@ -1,8 +1,9 @@
 streamlit
+openai
+requests
 pytesseract
 Pillow
-requests
-openai
+pandas
 websocket-client
 PyJWT
 cryptography
