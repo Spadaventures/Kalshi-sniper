@@ -9,10 +9,6 @@ from openai import OpenAI
 import os
 import csv
 import json
-import websocket
-
-# Must be the first Streamlit command
-st.set_page_config(page_title="Kalshi Sniper", layout="wide", initial_sidebar_state="collapsed")
 
 # ============ CONFIG ============
 openai.api_key = st.secrets["OPENAI_API_KEY"]
@@ -24,39 +20,15 @@ KALSHI_KEY_ID = st.secrets["KALSHI_KEY_ID"]
 KALSHI_PRIVATE_KEY = st.secrets["KALSHI_PRIVATE_KEY"]
 
 # ============ STREAMLIT UI ============
-st.markdown("""
-    <style>
-        .block-container {
-            padding-top: 1rem;
-            padding-bottom: 1rem;
-            padding-left: 1rem;
-            padding-right: 1rem;
-            max-width: 500px;
-            margin: auto;
-        }
-        .stTextInput > div > div > input, .stTextArea > div > textarea {
-            font-size: 16px;
-        }
-        .stButton > button {
-            width: 100%;
-            font-size: 18px;
-        }
-    </style>
-""", unsafe_allow_html=True)
-
-st.title("Kalshi Screenshot Analyzer (iOS Optimized)")
-st.markdown("Upload a screenshot of a Kalshi question with its YES/NO prices. I’ll extract it and tell you the most likely outcome.")
-
+st.set_page_config(page_title="Kalshi Sniper", layout="wide")
+st.title("📸 Kalshi Screenshot Analyzer (iOS Optimized)")
 uploaded_file = st.file_uploader("Upload Kalshi Screenshot", type=["png", "jpg", "jpeg"])
-run_button = st.button("Run AI Analysis")
+run_button = st.button("📈 Run AI Analysis")
 
 # ============ HELPER FUNCTIONS ============
 def extract_text_from_image(image_bytes):
-    try:
-        image = Image.open(io.BytesIO(image_bytes))
-        return pytesseract.image_to_string(image)
-    except Exception as e:
-        return f"Error reading image: {e}"
+    image = Image.open(io.BytesIO(image_bytes))
+    return pytesseract.image_to_string(image)
 
 @st.cache_data
 def load_historical_temps():
@@ -110,10 +82,10 @@ def get_weather_forecast(city):
         adjustment = min(1.0, max(0.5, 1 - (hours_to_event / 24)))
         adjusted_prob = raw_prob * adjustment
 
-        return f"Forecast high: {max_temp} F (hist avg {avg_temp:.1f} F, Delta {temp_deviation:+.1f}), Condition: {condition}, API spread: {spread:.1f} \nEst. Success Rate: {adjusted_prob:.1f}%", adjusted_prob
-
+        return f"Forecast high: {max_temp}°F (hist avg {avg_temp:.1f}°F, Δ {temp_deviation:+.1f}), Condition: {condition}, API spread: {spread:.1f}°
+Est. Success Rate: {adjusted_prob:.1f}%", adjusted_prob
     except Exception as e:
-        return f"Weather forecast unavailable ({str(e)})", 0
+        return f"Weather forecast unavailable: {e}", 0
 
 def extract_city(text):
     city_keywords = ["NYC", "New York", "Miami", "Denver", "Chicago", "Austin", "LA", "Los Angeles"]
@@ -123,19 +95,23 @@ def extract_city(text):
     return ""
 
 def format_prompt(text, weather_data=None):
-    weather_note = f"\n\nWeather forecast info:\n{weather_data}" if weather_data else ""
-    return (
-        "You are a high-accuracy AI prediction market analyst.\n\n"
-        f"Extracted Kalshi Market Text:\n{text}{weather_note}\n\n"
-        "1. Identify the market question and the YES/NO prices.\n"
-        "2. Estimate which outcome is underpriced.\n"
-        "3. Justify the decision with evidence (like weather forecast or seasonal norms).\n"
-        "4. Give an estimated percentage chance the prediction will be correct.\n"
-        "5. Respond in the format:\n"
-        "- Prediction: [Clear YES/NO range choice]\n"
-        "- Estimated Probability: [xx%]\n"
-        "- Reasoning: [Why this outcome is likely]"
-    )
+    weather_note = f"
+
+Weather forecast info:
+{weather_data}" if weather_data else ""
+    return f"""You are a high-accuracy AI prediction market analyst.
+
+Extracted Kalshi Market Text:
+{text}{weather_note}
+
+1. Identify the market question and the YES/NO prices.
+2. Estimate which outcome is underpriced.
+3. Justify the decision with evidence (like weather forecast or seasonal norms).
+4. Give an estimated percentage chance the prediction will be correct.
+5. Respond in the format:
+- 🔮 **Prediction**: [Clear YES/NO range choice]
+- 📈 **Estimated Probability**: [xx%]
+- 🧠 **Reasoning**: [Why this outcome is likely]"""
 
 def analyze_screenshot_text(text):
     city = extract_city(text)
@@ -146,8 +122,9 @@ def analyze_screenshot_text(text):
         weather_info, confidence_pct = get_weather_forecast(city)
 
     if confidence_pct < 40:
-        st.info(f"Skipping. Estimated chance of success is too low: {confidence_pct:.1f}%\nMarket: {text[:100]}")
-        return f"Skipping. Estimated chance of success is too low: {confidence_pct:.1f}%"
+        st.info(f"❌ Skipping. Estimated chance of success is too low: {confidence_pct:.1f}%
+Market: {text[:100]}")
+        return f"❌ Skipping. Estimated chance of success is too low: {confidence_pct:.1f}%"
 
     prompt = format_prompt(text, weather_info)
     client = OpenAI(api_key=openai.api_key)
@@ -161,10 +138,8 @@ def analyze_screenshot_text(text):
         max_tokens=600
     )
     result = response.choices[0].message.content.strip()
-
     if confidence_pct >= 80:
-        st.toast("High-probability opportunity detected!", icon="⚡")
-
+        st.toast("🚨 High-probability opportunity detected!", icon="⚡")
     return result
 
 # ============ ANALYSIS ============
@@ -172,4 +147,8 @@ if run_button and uploaded_file:
     image_text = extract_text_from_image(uploaded_file.read())
     with st.spinner("Analyzing screenshot..."):
         result = analyze_screenshot_text(image_text)
-        st.markdown(f"### Result:\n\n{result}\n\n---")
+        st.markdown(f"### 📊 Result:
+
+{result}
+
+---")
