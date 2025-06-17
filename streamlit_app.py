@@ -5,95 +5,105 @@ import pytesseract
 import requests
 import json
 import csv
-from datetime import datetime
+import pandas as pd
+from datetime import datetime, timedelta
 import threading
 import websocket
 import openai
 from openai import OpenAI
 
-# ============ PAGE CONFIG (MUST BE FIRST) ============
-st.set_page_config(page_title="Kalshi Sniper", layout="wide")
+# ============ PAGE CONFIG ============
+st.set_page_config(
+    page_title="Kalshi Sniper",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 # ============ SECRETS & CLIENT SETUP ============
 openai.api_key = st.secrets["OPENAI_API_KEY"]
 client = OpenAI()
 
-MODEL_NAME = "gpt-4o"
-OPENWEATHER_API_KEY = st.secrets["WEATHER_API_KEY"]
-WEATHERAPI_KEY      = st.secrets["WEATHERAPI_KEY"]
-TOMORROWIO_API_KEY  = st.secrets["TOMORROWIO_API_KEY"]
+MODEL_NAME           = "gpt-4o"
+OPENWEATHER_API_KEY  = st.secrets["WEATHER_API_KEY"]
+WEATHERAPI_KEY       = st.secrets["WEATHERAPI_KEY"]
+TOMORROWIO_API_KEY   = st.secrets["TOMORROWIO_API_KEY"]
+KALSHI_API_KEY       = st.secrets["KALSHI_API_KEY"]
+KALSHI_KEY_ID        = st.secrets["KALSHI_KEY_ID"]
 
-# ============ REAL-TIME KALSHI WEBSOCKET ============
-st.sidebar.markdown("## 🔄 Live Weather Markets")
-latest_market = st.sidebar.empty()
+# ============ SIDEBAR REAL-TIME FEED ============
+st.sidebar.header("🔄 Live Weather Markets")
+latest = st.sidebar.empty()
+WS_URL = "wss://trade-api.kalshi.com/ws/markets"
 
-KALSHI_WS_URL = "wss://trade-api.kalshi.com/ws/markets"
-def on_message(ws, message):
+def on_msg(ws, msg):
     try:
-        data = json.loads(message)
+        data = json.loads(msg)
         for m in data.get("markets", []):
-            if "temperature" in m["ticker"].lower() or "rain" in m["ticker"].lower():
-                latest_market.markdown(
-                    f"**{m['ticker']}** — Yes: {m.get('yes_price')} | No: {m.get('no_price')}"
-                )
+            if any(w in m["ticker"].lower() for w in ("temperature","rain")):
+                latest.markdown(f"**{m['ticker']}** — Yes: {m.get('yes_price')} | No: {m.get('no_price')}")
     except:
         pass
 
-def on_error(ws, error):
-    latest_market.error(f"WS Error: {error}")
+def on_err(ws, e):
+    latest.error(f"WS Error: {e}")
 
 def on_close(ws, _):
-    latest_market.warning("WebSocket closed")
+    latest.warning("WebSocket closed")
 
 def start_ws():
-    ws = websocket.WebSocketApp(
-        KALSHI_WS_URL,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
+    ws = websocket.WebSocketApp(WS_URL, on_message=on_msg, on_error=on_err, on_close=on_close)
     ws.run_forever()
 
 threading.Thread(target=start_ws, daemon=True).start()
 
-# ============ UI LAYOUT ============
-st.title("📸 Kalshi Screenshot Analyzer (iOS Optimized)")
-st.markdown(
-    "Upload a screenshot of a Kalshi weather market with its YES/NO prices, "
-    "and I'll tell you the most probable outcome."
-)
+# ============ TOP DAILY WEATHER PICKS ============
+@st.cache_data(ttl=300)
+def fetch_daily_weather_markets():
+    headers = {
+        "Authorization": f"Bearer {KALSHI_API_KEY}",
+        "X-Api-Key": KALSHI_KEY_ID
+    }
+    resp = requests.get("https://trading-api.kalshi.com/trade-api/v2/markets", headers=headers).json()
+    rows = []
+    for m in resp.get("markets", []):
+        if m.get("resolution") == "DAILY" and any(w in m["ticker"].lower() for w in ("temperature","rain")):
+            yes_pct = float(m.get("yes_price", 0.0)) * 100
+            rows.append({
+                "question": m["question"],
+                "ticker":   m["ticker"],
+                "yes_pct":  yes_pct,
+                "expires":  m.get("expiration_time")
+            })
+    return pd.DataFrame(rows).sort_values("yes_pct", ascending=False)
 
-DEBUG = st.sidebar.checkbox("🔍 Show API Debug Info", value=False)
-
-uploaded_file = st.file_uploader("Upload Kalshi Screenshot", type=["png","jpg","jpeg"])
-run_button   = st.button("📈 Run AI Analysis")
-
-# ============ HELPERS & DATA LOADING ============
+# ============ HISTORICAL DATA ============
 @st.cache_data
-def load_historical_temps():
+def load_historical():
     try:
         with open("historical_temps.csv", newline="") as f:
             return list(csv.DictReader(f))
     except:
         return []
 
-historical_data = load_historical_temps()
+historical = load_historical()
 
-def get_historical_temp(city: str):
-    temps = [float(r["temp"]) for r in historical_data if r["city"].lower()==city.lower()]
+def hist_avg(city: str):
+    temps = [float(r["temp"]) for r in historical if r["city"].lower() == city.lower()]
     return sum(temps)/len(temps) if temps else None
 
-def extract_text_from_image(image_bytes: bytes) -> str:
-    img = Image.open(io.BytesIO(image_bytes))
-    return pytesseract.image_to_string(img)
+# ============ HELPERS ============
+def extract_city(txt: str) -> str:
+    for c in ("NYC","New York","Miami","Denver","Chicago","Austin","LA","Los Angeles"):
+        if c.lower() in txt.lower():
+            return c
+    return ""
 
-def calculate_hours_until_event() -> float:
+def calc_hours_until_eod() -> float:
     now = datetime.now()
     eod = datetime.combine(now.date(), datetime.max.time())
     return (eod - now).total_seconds() / 3600
 
-# ============ WEATHER FORECAST WITH FALLBACK ============
-def get_weather_forecast(city: str):
+def get_weather_forecast(city: str, debug: bool=False):
     forecasts = []
     # OpenWeather
     try:
@@ -104,7 +114,7 @@ def get_weather_forecast(city: str):
         temps = [e["main"]["temp"] for e in r["list"][:8]]
         forecasts.append(max(temps))
     except Exception as e:
-        if DEBUG: st.warning(f"OpenWeather error: {e}")
+        if debug: st.warning(f"OpenWeather error: {e}")
     # WeatherAPI.com
     try:
         r = requests.get(
@@ -113,7 +123,7 @@ def get_weather_forecast(city: str):
         ).json()
         forecasts.append(r["forecast"]["forecastday"][0]["day"]["maxtemp_f"])
     except Exception as e:
-        if DEBUG: st.warning(f"WeatherAPI error: {e}")
+        if debug: st.warning(f"WeatherAPI error: {e}")
     # Tomorrow.io
     try:
         r = requests.get(
@@ -122,80 +132,100 @@ def get_weather_forecast(city: str):
         ).json()
         forecasts.append(r["timelines"]["daily"][0]["values"]["temperatureMax"])
     except Exception as e:
-        if DEBUG: st.warning(f"Tomorrow.io error: {e}")
+        if debug: st.warning(f"Tomorrow.io error: {e}")
 
     if not forecasts:
-        hist = get_historical_temp(city) or 75
-        if DEBUG: st.info(f"All APIs failed; using historical avg {hist}")
-        return f"All weather APIs failed. Using historical avg {hist}°F", 30
+        hist = hist_avg(city) or 75
+        if debug: st.info(f"All APIs failed; using hist avg {hist}°F")
+        return f"All APIs failed; hist avg {hist}°F", 30
 
-    max_temp = round(sum(forecasts)/len(forecasts), 1)
-    spread   = max(forecasts) - min(forecasts)
-    # weather description from first API if available
-    cond = (r["list"][0]["weather"][0]["description"]
-            if "list" in locals() else "unknown")
-    avg_hist = get_historical_temp(city) or 75
-    deviation = max_temp - avg_hist
-
-    raw = 50 + deviation*3 - spread*2
+    mx = round(sum(forecasts)/len(forecasts), 1)
+    sp = max(forecasts) - min(forecasts)
+    avg_hist = hist_avg(city) or 75
+    dev = mx - avg_hist
+    raw = 50 + dev*3 - sp*2
     raw = max(10, min(100, raw))
-    # decay factor as event approaches
-    hours = calculate_hours_until_event()
-    factor = max(0.5, 1 - hours/24)
-    pct = raw * factor
+    hrs = calc_hours_until_eod()
+    pct = raw * max(0.5, 1 - hrs/24)
 
-    text = (
-        f"Forecast high: {max_temp}°F (hist avg {avg_hist:.1f}°F, Δ{deviation:+.1f}), "
-        f"Condition: {cond}, spread: {spread:.1f}°\n"
-        f"Est. Success Rate: {pct:.1f}%"
+    cond = (r["list"][0]["weather"][0]["description"] if "list" in locals() else "unknown")
+    info = (
+        f"High: {mx}°F (hist {avg_hist:.1f}°F, Δ{dev:+.1f}), "
+        f"{cond}, spread {sp:.1f}° → {pct:.1f}%"
     )
-    return text, pct
+    return info, pct
 
-# ============ TEXT ANALYSIS & GPT PROMPT ============
-def extract_city(text: str) -> str:
-    for c in ("NYC","New York","Miami","Denver","Chicago","Austin","LA","Los Angeles"):
-        if c.lower() in text.lower():
-            return c
-    return ""
-
-def format_prompt(market_text, weather_info=""):
-    return (
-        "You are a high accuracy prediction market analyst.\n\n"
-        f"Market:\n{market_text}\n\n"
+def ask_gpt_prediction(question: str, weather_info: str) -> str:
+    prompt = (
+        "You are a high-accuracy prediction market analyst.\n\n"
+        f"Market:\n{question}\n\n"
         f"Weather:\n{weather_info}\n\n"
-        "1. Identify YES/NO prices.\n"
-        "2. Which outcome is underpriced?\n"
-        "3. Justify with evidence.\n"
-        "4. Give probability.\n\n"
-        "Respond:\n"
+        "1) Identify YES/NO prices.\n"
+        "2) Which outcome is underpriced?\n"
+        "3) Justify with evidence.\n"
+        "4) Give probability.\n\n"
+        "Reply:\n"
         "- Prediction: [your pick]\n"
         "- Probability: [xx%]\n"
         "- Reasoning: [why]\n"
     )
-
-def analyze_screenshot_text(text: str):
-    city = extract_city(text)
-    winfo = ""
-    pct = 0
-    if city:
-        winfo, pct = get_weather_forecast(city)
-    if pct < 40:
-        st.info(f"Skipping low probability ({pct:.1f}%) for market:\n{text}")
-        return f"Skipping; too low ({pct:.1f}%)"
-    prompt = format_prompt(text, winfo)
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
             {"role":"system","content":"You are cautious but effective."},
-            {"role":"user",  "content":prompt}
+            {"role":"user","content":prompt}
         ],
         temperature=0.3
     )
     return resp.choices[0].message.content.strip()
 
-# ============ MAIN ============ 
-if run_button and uploaded_file:
-    raw = extract_text_from_image(uploaded_file.read())
-    with st.spinner("Analyzing…"):
-        out = analyze_screenshot_text(raw)
-    st.markdown(f"### Result\n\n{out}")
+# ============ MANUAL UPLOAD ============
+def ocr_and_analyze(uploaded, debug):
+    img = Image.open(io.BytesIO(uploaded.read()))
+    text = pytesseract.image_to_string(img)
+    city = extract_city(text)
+    weather_info, conf = ("", 0)
+    if city:
+        weather_info, conf = get_weather_forecast(city, debug)
+    prediction = ask_gpt_prediction(text, weather_info)
+    return text, weather_info, conf, prediction
+
+# ============ TABS UI ============
+tab1, tab2 = st.tabs(["📊 Auto Scan", "📸 Manual Upload"])
+
+with tab1:
+    st.header("Top High-Confidence Daily Weather Bets")
+    threshold = st.slider("Show markets with model confidence ≥", 10, 100, 60)
+    debug_flag = st.sidebar.checkbox("🔍 Debug Info (Auto)", value=False)
+    df = fetch_daily_weather_markets()
+    results = []
+    for _, row in df.iterrows():
+        city = extract_city(row["ticker"]) or extract_city(row["question"])
+        info, pct = get_weather_forecast(city, debug_flag)
+        if pct >= threshold:
+            pred = ask_gpt_prediction(row["question"], info)
+            results.append({
+                "Market":      row["question"],
+                "Yes % (mkt)": f"{row['yes_pct']:.1f}%",
+                "Conf % (mdl)": f"{pct:.1f}%",
+                "GPT Prediction": pred
+            })
+    if results:
+        st.dataframe(pd.DataFrame(results), use_container_width=True)
+    else:
+        st.info("No markets exceed that confidence threshold.")
+
+with tab2:
+    st.header("Upload a Kalshi Screenshot")
+    debug_flag_u = st.sidebar.checkbox("🔍 Debug Info (Upload)", value=False, key="upl")
+    uploaded = st.file_uploader("PNG/JPG Screenshot", type=["png","jpg","jpeg"])
+    if st.button("Analyze Screenshot") and uploaded:
+        raw_text, weather_info, conf, prediction = ocr_and_analyze(uploaded, debug_flag_u)
+        st.subheader("🔍 OCR Text")
+        st.write(raw_text)
+        st.subheader("🌡️ Weather Model")
+        st.write(weather_info)
+        st.subheader("📈 Model Confidence")
+        st.write(f"{conf:.1f}%")
+        st.subheader("🤖 GPT Prediction")
+        st.write(prediction)
