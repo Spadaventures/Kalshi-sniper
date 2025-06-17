@@ -1,32 +1,36 @@
 import streamlit as st
-from PIL import Image
-import io
-import pytesseract
+import textwrap
+import time
+import jwt
+import threading
+import websocket
 import requests
 import json
 import csv
 import pandas as pd
 from datetime import datetime
-import threading
-import websocket
+from PIL import Image
+import io
+import pytesseract
 import openai
-import time
-import jwt
 
 # ============ PAGE CONFIG ============
-st.set_page_config(page_title="Kalshi Sniper", layout="wide")
+st.set_page_config(page_title="Kalshi Sniper", layout="wide", initial_sidebar_state="expanded")
 
 # ============ SECRETS & CLIENT SETUP ============
-openai.api_key       = st.secrets["OPENAI_API_KEY"]
-client               = openai.OpenAI()
+openai.api_key = st.secrets["OPENAI_API_KEY"]
 
-MODEL_NAME           = "gpt-4o"
-OPENWEATHER_API_KEY  = st.secrets["WEATHER_API_KEY"]
-WEATHERAPI_KEY       = st.secrets["WEATHERAPI_KEY"]
-TOMORROWIO_API_KEY   = st.secrets["TOMORROWIO_API_KEY"]
+MODEL_NAME = "gpt-4o"
+OPENWEATHER_API_KEY = st.secrets["WEATHER_API_KEY"]
+WEATHERAPI_KEY      = st.secrets["WEATHERAPI_KEY"]
+TOMORROWIO_API_KEY  = st.secrets["TOMORROWIO_API_KEY"]
 
-KALSHI_KEY_ID        = st.secrets["KALSHI_KEY_ID"]
-KALSHI_PRIVATE_KEY   = st.secrets["KALSHI_PRIVATE_KEY"]
+# Pull Kalshi Key ID and Private Key, then normalize the PEM
+_KALSHI_KEY_ID_raw     = st.secrets["KALSHI_KEY_ID"]
+_KALSHI_PRIVATE_key_raw = st.secrets["KALSHI_PRIVATE_KEY"]
+
+KALSHI_KEY_ID     = _KALSHI_KEY_ID_raw.strip()
+KALSHI_PRIVATE_KEY = textwrap.dedent(_KALSHI_PRIVATE_key_raw).strip()
 
 # ============ JWT HELPER ============
 def get_kalshi_bearer_token() -> str:
@@ -34,7 +38,7 @@ def get_kalshi_bearer_token() -> str:
     payload = {
         "iss": KALSHI_KEY_ID,
         "iat": now,
-        "exp": now + 600   # valid 10 minutes
+        "exp": now + 600  # valid for 10 minutes
     }
     return jwt.encode(payload, KALSHI_PRIVATE_KEY, algorithm="RS256")
 
@@ -60,7 +64,7 @@ def on_close(ws, _):
 
 def start_ws():
     if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY:
-        latest.info("🔒 Add your Kalshi secrets to enable live feed.")
+        latest.info("🔒 Add your Kalshi secrets to `.streamlit/secrets.toml` to enable live feed.")
         return
     bearer = get_kalshi_bearer_token()
     headers = [
@@ -78,7 +82,7 @@ def start_ws():
 
 threading.Thread(target=start_ws, daemon=True).start()
 
-# ============ TOP DAILY WEATHER PICKS ============
+# ============ FETCH DAILY WEATHER MARKETS ============
 @st.cache_data(ttl=300)
 def fetch_daily_weather_markets():
     if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY:
@@ -94,11 +98,8 @@ def fetch_daily_weather_markets():
     ).json()
     rows = []
     for m in resp.get("markets", []):
-        if (
-            m.get("resolution") == "DAILY"
-            and any(w in m["ticker"].lower() for w in ("temperature","rain"))
-        ):
-            yes_pct = float(m.get("yes_price",0)) * 100
+        if m.get("resolution") == "DAILY" and any(w in m["ticker"].lower() for w in ("temperature","rain")):
+            yes_pct = float(m.get("yes_price", 0.0)) * 100
             rows.append({
                 "question": m["question"],
                 "ticker":   m["ticker"],
@@ -170,19 +171,16 @@ def get_weather_forecast(city: str, debug: bool=False):
         if debug: st.info(f"All APIs failed; using hist avg {hist}°F")
         return f"All APIs failed; hist avg {hist}°F", 30
 
-    mx      = round(sum(forecasts)/len(forecasts),1)
-    sp      = max(forecasts) - min(forecasts)
-    avg_hist= get_historical_temp(city) or 75
-    dev     = mx - avg_hist
-    raw     = 50 + dev*3 - sp*2
-    raw     = max(10, min(100, raw))
-    hrs     = calc_hours_until_event()
-    pct     = raw * max(0.5, 1 - hrs/24)
-    cond    = (r["list"][0]["weather"][0]["description"] if "list" in locals() else "unknown")
-    info    = (
-        f"High: {mx}°F (hist {avg_hist:.1f}°F, Δ{dev:+.1f}), "
-        f"{cond}, spread {sp:.1f}° → {pct:.1f}%"
-    )
+    mx       = round(sum(forecasts)/len(forecasts), 1)
+    sp       = max(forecasts) - min(forecasts)
+    avg_hist = get_historical_temp(city) or 75
+    dev      = mx - avg_hist
+    raw      = 50 + dev*3 - sp*2
+    raw      = max(10, min(100, raw))
+    hrs      = calc_hours_until_event()
+    pct      = raw * max(0.5, 1 - hrs/24)
+    cond     = (r["list"][0]["weather"][0]["description"] if "list" in locals() else "unknown")
+    info     = f"High: {mx}°F (hist {avg_hist:.1f}°F, Δ{dev:+.1f}), {cond}, spread {sp:.1f}° → {pct:.1f}%"
     return info, pct
 
 def ask_gpt_prediction(question: str, weather_info: str) -> str:
@@ -199,7 +197,7 @@ def ask_gpt_prediction(question: str, weather_info: str) -> str:
         "- Probability: [xx%]\n"
         "- Reasoning: [why]\n"
     )
-    resp = client.chat.completions.create(
+    resp = openai.ChatCompletion.create(
         model=MODEL_NAME,
         messages=[
             {"role":"system","content":"You are cautious but effective."},
