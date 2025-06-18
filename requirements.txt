@@ -1,11 +1,8 @@
 streamlit
 openai
-requests
 pytesseract
 Pillow
-pandas
-websocket-client
-PyJWT
-cryptography
+requests
 numpy
 netCDF4
+metpy
