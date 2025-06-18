@@ -1,10 +1,19 @@
-import io, textwrap, datetime
-import numpy as np, requests, streamlit as st, pytesseract
+import os
+import io
+import textwrap
+import datetime
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+import pytesseract
 from PIL import Image
 from netCDF4 import Dataset
 from metpy.io import parse_metar_to_dataframe
 from openai import OpenAI
-import pandas as pd, joblib
+import joblib
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
 
@@ -40,22 +49,29 @@ def get_weather_ensemble(city: str):
         r = requests.get(
             "https://api.openweathermap.org/data/2.5/forecast",
             params={"q": city, "appid": WEATHER_API_KEY, "units": "imperial"},
-            timeout=5).json()
+            timeout=5
+        ).json()
         block = r.get("list", [])[:8]
         temps.append(max(e["main"]["temp"] for e in block))
-    except: pass
+    except:
+        pass
+
     try:
         r = requests.get(
             "http://api.weatherapi.com/v1/forecast.json",
             params={"key": WEATHERAPI_KEY, "q": city, "days": 1},
-            timeout=5).json()
+            timeout=5
+        ).json()
         temps.append(r["forecast"]["forecastday"][0]["day"]["maxtemp_f"])
-    except: pass
+    except:
+        pass
+
     if not temps:
         return None, 0.0
-    avg    = round(sum(temps)/len(temps), 1)
-    spread = max(temps)-min(temps)
-    raw    = max(10, min(100, 50 + (avg-75)*3 - spread*2))
+
+    avg    = round(sum(temps) / len(temps), 1)
+    spread = max(temps) - min(temps)
+    raw    = max(10, min(100, 50 + (avg - 75) * 3 - spread * 2))
     return (avg, spread, temps), raw
 
 def get_precip_nowcast(city: str) -> float:
@@ -68,89 +84,95 @@ def get_precip_nowcast(city: str) -> float:
                 "fields": ["precipitationIntensity"],
                 "timesteps": ["1m"],
                 "units": "imperial"
-            }, timeout=5).json()
+            },
+            timeout=5
+        ).json()
         iv = r["data"]["timelines"][0]["intervals"]
-        cnt = sum(1 for x in iv if x["values"]["precipitationIntensity"]>0.02)
-        return cnt/len(iv)
+        cnt = sum(1 for x in iv if x["values"]["precipitationIntensity"] > 0.02)
+        return cnt / len(iv)
     except:
         return 0.0
 
 def get_hrrr_nowcast(city: str) -> float:
     lat, lon, _ = CITY_COORDS[city]
-    now       = datetime.datetime.utcnow()
-    ds_date   = now.strftime("%Y%m%d")
-    cycle_str = f"{now.hour:02d}00"
+    now         = datetime.datetime.utcnow()
+    date_str    = now.strftime("%Y%m%d")
+    cycle_str   = f"{now.hour:02d}00"
     url = (
-      f"https://thredds.ncep.noaa.gov/thredds/dodsC/"
-      f"hrrr/hrrr_sfc/hrrr_sfc_{ds_date}/"
-      f"hrrr.t{cycle_str}.sfc.grib2"
+        f"https://thredds.ncep.noaa.gov/thredds/dodsC/"
+        f"hrrr/hrrr_sfc/hrrr_sfc_{date_str}/"
+        f"hrrr.t{cycle_str}.sfc.grib2"
     )
     try:
         ds   = Dataset(url)
         refl = ds.variables["REFL_L8"]
         lats = ds.variables["lat"][:]
         lons = ds.variables["lon"][:]
-        i = np.abs(lats-lat).argmin()
-        j = np.abs(lons-lon).argmin()
-        radar = refl[1,:,:]
-        win   = radar[max(0,i-2):min(i+3,radar.shape[0]),
-                      max(0,j-2):min(j+3,radar.shape[1])]
-        pct = float(np.mean(win>30.0))
+        i = np.abs(lats - lat).argmin()
+        j = np.abs(lons - lon).argmin()
+        radar_slice = refl[1, :, :]
+        win = radar_slice[
+            max(0, i - 2):min(i + 3, radar_slice.shape[0]),
+            max(0, j - 2):min(j + 3, radar_slice.shape[1])
+        ]
+        pct = float(np.mean(win > 30.0))
         ds.close()
         return pct
     except:
         return 0.0
 
 def get_metar(city: str):
-    _,_,icao = CITY_COORDS[city]
+    _, _, icao = CITY_COORDS[city]
     try:
         txt = requests.get(
             f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{icao}.TXT",
-            timeout=5).text
+            timeout=5
+        ).text
         df  = parse_metar_to_dataframe(io.StringIO(txt))
         row = df.iloc[-1]
         return row["temp"], row["dewpoint"], row["wind_speed"]
     except:
         return None, None, None
 
-# ============ AUTOMATIC HYPERPARAM TUNING & RETRAIN ============
+# ============ AUTOMATIC HYPERPARAMETER TUNING & RETRAINING ============
 
 def train_ml_model():
-    """Load LOG_FILE, do RandomizedSearchCV if ≥10 rows, save best model."""
     if not os.path.exists(LOG_FILE):
         return None, None
+
     df = pd.read_csv(LOG_FILE).dropna(subset=["actual_outcome"])
     if len(df) < 10:
         return None, None
 
-    # prepare features
+    # feature engineering
     df["gpt_prob_f"]       = df["gpt_prob"].astype(float)
     df["nowcast_pct_f"]    = df["nowcast_pct"].astype(float)
     df["blend_conf_f"]     = df["blend_conf"].astype(float)
     df["weather_avg_f"]    = df["weather_avg"].astype(float)
     df["weather_spread_f"] = df["weather_spread"].astype(float)
     df["market_yes_pct_f"] = df["market_yes_pct"].astype(float)
-    df["side_bin"]         = (df["gpt_side"]=="Yes").astype(int)
-    df["win"]              = ((df["gpt_range"]==df["actual_outcome"]) & (df["side_bin"]==1)).astype(int)
+    df["side_bin"]         = (df["gpt_side"] == "Yes").astype(int)
+    df["win"]              = ((df["gpt_range"] == df["actual_outcome"]) & (df["side_bin"] == 1)).astype(int)
 
     X = df[["weather_avg_f","weather_spread_f","nowcast_pct_f","blend_conf_f","market_yes_pct_f","side_bin"]]
     y = df["win"]
 
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # hyperparam space
+    # hyperparameter search space
     param_dist = {
-      "n_estimators": [100,200,300,400],
-      "max_depth": [None,5,10,20,30],
-      "min_samples_split": [2,5,10],
-      "min_samples_leaf": [1,2,4],
-      "max_features": ["auto","sqrt","log2"]
+        "n_estimators":    [100,200,300,400],
+        "max_depth":       [None,5,10,20],
+        "min_samples_split":[2,5,10],
+        "min_samples_leaf":[1,2,4],
+        "max_features":    ["auto","sqrt","log2"]
     }
 
     search = RandomizedSearchCV(
-      RandomForestClassifier(random_state=42),
-      param_distributions=param_dist,
-      n_iter=20, cv=3, scoring="accuracy", n_jobs=-1, random_state=42
+        RandomForestClassifier(random_state=42),
+        param_distributions=param_dist,
+        n_iter=20, cv=3, scoring="accuracy",
+        n_jobs=-1, random_state=42
     )
     search.fit(Xtr, ytr)
     best = search.best_estimator_
@@ -178,8 +200,8 @@ def ask_gpt(question: str, confidence: float) -> str:
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[
-          {"role":"system","content":"Be concise."},
-          {"role":"user","content":prompt}
+            {"role":"system","content":"Be concise."},
+            {"role":"user","content":prompt}
         ],
         temperature=0.3, max_tokens=150
     )
@@ -195,13 +217,13 @@ def parse_reply(txt: str):
 
 # ============ UI & BOOTSTRAP ============
 
-# Train / tune on startup
 with st.spinner("🔧 Tuning & retraining model…"):
     clf, ml_acc = train_ml_model()
-rows = sum(1 for _ in open(LOG_FILE)) -1 if os.path.exists(LOG_FILE) else 0
+
+rows    = sum(1 for _ in open(LOG_FILE)) - 1 if os.path.exists(LOG_FILE) else 0
 base_acc = ml_acc if ml_acc is not None else 0.72
-ev_day   = (2*base_acc-1)*100
-ev_mon   = ev_day*30
+ev_day   = (2*base_acc - 1)*100
+ev_mon   = ev_day * 30
 
 st.metric("📊 Logged rows", rows)
 if ml_acc is not None:
@@ -209,7 +231,6 @@ if ml_acc is not None:
 st.metric("🔮 Est. accuracy", f"{base_acc*100:.1f}%")
 st.metric("💵 EV/day (@100)", f"${ev_day:.1f}", delta=f"${ev_mon:.0f}/mo")
 
-# Prediction flow
 st.title("🌡️ Temp-Only Sniper v3")
 st.markdown("Upload a “Highest temperature in X” screenshot (LA/NYC/Miami).")
 
