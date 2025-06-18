@@ -1,10 +1,7 @@
 streamlit
 openai
+numpy
+pandas
 pytesseract
 Pillow
-requests
-numpy
-netCDF4
-metpy
-scikit-learn
-joblib
+websocket-client
