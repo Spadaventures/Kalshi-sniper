@@ -31,20 +31,21 @@ MODEL   = "gpt-4o"
 LOG_FILE   = "predictions_log.csv"
 MODEL_FILE = "bet_model_tuned.pkl"
 
-# City → (lat, lon, ICAO)
+# City → (lat, lon, station_id)
 CITY_COORDS = {
-    "LA":        (34.05,  -118.25, "KLAX"),
-    "New York": (40.71,   -74.01, "KJFK"),
-    "Miami":     (25.77,   -80.19, "KMIA"),
+    "LA":        (34.05,   -118.25, "KLAX"),          # LAX Airport METAR
+    "New York": (40.78,    -73.97,  "USW00094728"),   # Central Park NOAA station
+    "Miami":     (25.77,   -80.19,  "KMIA"),          # Miami Intl METAR
 }
 
-# ============ OCR & SIGNALS ============
+# ============ OCR & SIGNAL FUNCTIONS ============
 
 def extract_text(img_bytes: bytes) -> str:
     return pytesseract.image_to_string(Image.open(io.BytesIO(img_bytes)))
 
 def get_weather_ensemble(city: str):
     temps = []
+    # OpenWeather 24h high
     try:
         r = requests.get(
             "https://api.openweathermap.org/data/2.5/forecast",
@@ -56,6 +57,7 @@ def get_weather_ensemble(city: str):
     except:
         pass
 
+    # WeatherAPI.com 1-day high
     try:
         r = requests.get(
             "http://api.weatherapi.com/v1/forecast.json",
@@ -69,9 +71,9 @@ def get_weather_ensemble(city: str):
     if not temps:
         return None, 0.0
 
-    avg    = round(sum(temps) / len(temps), 1)
+    avg    = round(sum(temps)/len(temps), 1)
     spread = max(temps) - min(temps)
-    raw    = max(10, min(100, 50 + (avg - 75) * 3 - spread * 2))
+    raw    = max(10, min(100, 50 + (avg - 75)*3 - spread*2))
     return (avg, spread, temps), raw
 
 def get_precip_nowcast(city: str) -> float:
@@ -122,12 +124,10 @@ def get_hrrr_nowcast(city: str) -> float:
         return 0.0
 
 def get_metar(city: str):
-    _, _, icao = CITY_COORDS[city]
+    _, _, station = CITY_COORDS[city]
     try:
-        txt = requests.get(
-            f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{icao}.TXT",
-            timeout=5
-        ).text
+        url = f"https://tgftp.nws.noaa.gov/data/observations/metar/stations/{station}.TXT"
+        txt = requests.get(url, timeout=5).text
         df  = parse_metar_to_dataframe(io.StringIO(txt))
         row = df.iloc[-1]
         return row["temp"], row["dewpoint"], row["wind_speed"]
@@ -187,7 +187,7 @@ def ask_gpt_value(city, weather_summary, confidence, market_probs):
 
         Signals:
         {weather_summary}
-        Blended confidence for “Yes” on a given range: {confidence:.1f}%.
+        Blended confidence: {confidence:.1f}%.
 
         Market probabilities:
         {market_probs}
@@ -226,7 +226,7 @@ with st.spinner("🔧 Tuning model…"):
 rows    = sum(1 for _ in open(LOG_FILE)) - 1 if os.path.exists(LOG_FILE) else 0
 base_acc = ml_acc if ml_acc is not None else 0.72
 ev_day   = (2*base_acc - 1)*100
-ev_mon   = ev_day*30
+ev_mon   = ev_day * 30
 
 st.metric("📊 Rows logged", rows)
 if ml_acc is not None:
@@ -243,7 +243,6 @@ if st.button("Analyze") and up:
     st.subheader("📝 Extracted Text")
     st.write(text)
 
-    # allow NYC alias
     tl = text.lower()
     if "highest temperature" not in tl:
         st.error("Only ‘Highest temperature’ markets supported.")
