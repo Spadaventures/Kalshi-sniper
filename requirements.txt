@@ -6,3 +6,5 @@ requests
 numpy
 netCDF4
 metpy
+scikit-learn
+joblib
