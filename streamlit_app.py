@@ -31,10 +31,11 @@ MODEL   = "gpt-4o"
 LOG_FILE   = "predictions_log.csv"
 MODEL_FILE = "bet_model_tuned.pkl"
 
+# City → (lat, lon, ICAO)
 CITY_COORDS = {
-    "LA":        (34.05, -118.25, "KLAX"),
-    "New York": (40.71,  -74.01, "KJFK"),
-    "Miami":     (25.77,  -80.19, "KMIA"),
+    "LA":        (34.05,  -118.25, "KLAX"),
+    "New York": (40.71,   -74.01, "KJFK"),
+    "Miami":     (25.77,   -80.19, "KMIA"),
 }
 
 # ============ OCR & SIGNALS ============
@@ -52,7 +53,8 @@ def get_weather_ensemble(city: str):
         ).json()
         block = r.get("list", [])[:8]
         temps.append(max(e["main"]["temp"] for e in block))
-    except: pass
+    except:
+        pass
 
     try:
         r = requests.get(
@@ -61,14 +63,15 @@ def get_weather_ensemble(city: str):
             timeout=5
         ).json()
         temps.append(r["forecast"]["forecastday"][0]["day"]["maxtemp_f"])
-    except: pass
+    except:
+        pass
 
     if not temps:
         return None, 0.0
 
-    avg    = round(sum(temps)/len(temps), 1)
+    avg    = round(sum(temps) / len(temps), 1)
     spread = max(temps) - min(temps)
-    raw    = max(10, min(100, 50 + (avg - 75)*3 - spread*2))
+    raw    = max(10, min(100, 50 + (avg - 75) * 3 - spread * 2))
     return (avg, spread, temps), raw
 
 def get_precip_nowcast(city: str) -> float:
@@ -86,7 +89,7 @@ def get_precip_nowcast(city: str) -> float:
         ).json()
         iv = r["data"]["timelines"][0]["intervals"]
         cnt = sum(1 for x in iv if x["values"]["precipitationIntensity"] > 0.02)
-        return cnt/len(iv)
+        return cnt / len(iv)
     except:
         return 0.0
 
@@ -107,10 +110,10 @@ def get_hrrr_nowcast(city: str) -> float:
         lons = ds.variables["lon"][:]
         i = np.abs(lats - lat).argmin()
         j = np.abs(lons - lon).argmin()
-        radar = refl[1,:,:]
+        radar = refl[1, :, :]
         win   = radar[
-            max(0,i-2):min(i+3,radar.shape[0]),
-            max(0,j-2):min(j+3,radar.shape[1])
+            max(0, i-2):min(i+3, radar.shape[0]),
+            max(0, j-2):min(j+3, radar.shape[1])
         ]
         pct = float(np.mean(win > 30.0))
         ds.close()
@@ -136,6 +139,7 @@ def get_metar(city: str):
 def train_ml_model():
     if not os.path.exists(LOG_FILE):
         return None, None
+
     df = pd.read_csv(LOG_FILE).dropna(subset=["actual_outcome"])
     if len(df) < 10:
         return None, None
@@ -145,19 +149,20 @@ def train_ml_model():
     df["weather_avg_f"]    = df["weather_avg"].astype(float)
     df["weather_spread_f"] = df["weather_spread"].astype(float)
     df["market_yes_pct_f"] = df["market_yes_pct"].astype(float)
-    df["side_bin"]         = (df["gpt_side"]=="Yes").astype(int)
-    df["win"]              = ((df["gpt_range"]==df["actual_outcome"]) & (df["side_bin"]==1)).astype(int)
+    df["side_bin"]         = (df["gpt_side"] == "Yes").astype(int)
+    df["win"]              = ((df["gpt_range"] == df["actual_outcome"]) & (df["side_bin"] == 1)).astype(int)
 
     X = df[["weather_avg_f","weather_spread_f","nowcast_pct_f","blend_conf_f","market_yes_pct_f","side_bin"]]
     y = df["win"]
-    Xtr, Xte, ytr, yte = train_test_split(X,y,test_size=0.2,random_state=42)
+
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42)
 
     param_dist = {
-        "n_estimators":    [100,200,300,400],
-        "max_depth":       [None,5,10,20],
+        "n_estimators":     [100,200,300,400],
+        "max_depth":        [None,5,10,20],
         "min_samples_split":[2,5,10],
-        "min_samples_leaf":[1,2,4],
-        "max_features":    ["auto","sqrt","log2"]
+        "min_samples_leaf": [1,2,4],
+        "max_features":     ["auto","sqrt","log2"]
     }
 
     search = RandomizedSearchCV(
@@ -166,9 +171,10 @@ def train_ml_model():
         n_iter=20, cv=3, scoring="accuracy",
         n_jobs=-1, random_state=42
     )
-    search.fit(Xtr,ytr)
+    search.fit(Xtr, ytr)
     best = search.best_estimator_
-    acc  = best.score(Xte,yte)
+    acc  = best.score(Xte, yte)
+
     joblib.dump(best, MODEL_FILE)
     return best, acc
 
@@ -186,8 +192,8 @@ def ask_gpt_value(city, weather_summary, confidence, market_probs):
         Market probabilities:
         {market_probs}
 
-        Identify which outcome is underpriced (i.e. where your blended confidence exceeds the market price).
-        Respond exactly in this format:
+        Identify which outcome is underpriced (where your confidence > market price).
+        Respond exactly:
         Range: [e.g. 78° or above]
         Side: Yes
         Probability: [xx%]
@@ -205,11 +211,11 @@ def ask_gpt_value(city, weather_summary, confidence, market_probs):
     return resp.choices[0].message.content.strip()
 
 def parse_reply(txt: str):
-    out={"Range":"","Side":"","Probability":"","Reasoning":""}
+    out = {"Range":"","Side":"","Probability":"","Reasoning":""}
     for L in txt.splitlines():
         for k in out:
             if L.lower().startswith(k.lower()+":"):
-                out[k]=L.split(":",1)[1].strip()
+                out[k] = L.split(":",1)[1].strip()
     return out
 
 # ============ BOOTSTRAP & UI ============
@@ -217,9 +223,9 @@ def parse_reply(txt: str):
 with st.spinner("🔧 Tuning model…"):
     clf, ml_acc = train_ml_model()
 
-rows    = sum(1 for _ in open(LOG_FILE)) -1 if os.path.exists(LOG_FILE) else 0
+rows    = sum(1 for _ in open(LOG_FILE)) - 1 if os.path.exists(LOG_FILE) else 0
 base_acc = ml_acc if ml_acc is not None else 0.72
-ev_day   = (2*base_acc -1)*100
+ev_day   = (2*base_acc - 1)*100
 ev_mon   = ev_day*30
 
 st.metric("📊 Rows logged", rows)
@@ -237,35 +243,44 @@ if st.button("Analyze") and up:
     st.subheader("📝 Extracted Text")
     st.write(text)
 
-    if "highest temperature" not in text.lower():
+    # allow NYC alias
+    tl = text.lower()
+    if "highest temperature" not in tl:
         st.error("Only ‘Highest temperature’ markets supported.")
     else:
-        city = next((c for c in CITY_COORDS if c.lower() in text.lower()), "")
+        aliases = {
+            "la": "LA",
+            "los angeles": "LA",
+            "nyc": "New York",
+            "new york": "New York",
+            "miami": "Miami"
+        }
+        city = ""
+        for alias, canon in aliases.items():
+            if alias in tl:
+                city = canon
+                break
+
         if not city:
             st.error("Only LA, New York or Miami supported.")
         else:
-            (avg,spread,temps),raw = get_weather_ensemble(city)
+            (avg, spread, temps), raw = get_weather_ensemble(city)
             nowc = get_precip_nowcast(city)
             hrrr = get_hrrr_nowcast(city)
-            mt,dp,ws = get_metar(city)
+            mt, dp, ws = get_metar(city)
 
             st.write(f"🌡️ Temps: {temps} → avg {avg}°F, spread {spread:.1f}°")
             if mt is not None:
                 st.write(f"✈️ METAR °C: {mt:.1f}, dew {dp:.1f}, wind {ws:.0f} kt")
 
-            # build summary for GPT
             weather_summary = (
                 f"Forecast avg high: {avg}°F; "
                 f"rain nowcast: {nowc*100:.1f}%; "
                 f"HRRR storm: {hrrr*100:.1f}%; "
                 f"spread: {spread:.1f}°"
             )
-
-            # strip market lines
             market_probs = "\n".join(
-                line.strip()
-                for line in text.splitlines()
-                if "%" in line and "Yes" in line
+                L.strip() for L in text.splitlines() if "%" in L and "Yes" in L
             )
 
             final_conf = raw*0.6 + nowc*100*0.15 + hrrr*100*0.15
