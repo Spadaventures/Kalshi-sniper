@@ -1,7 +1,5 @@
 streamlit
 openai
 numpy
-pandas
-pytesseract
-Pillow
+requests
 websocket-client
