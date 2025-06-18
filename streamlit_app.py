@@ -31,21 +31,19 @@ MODEL   = "gpt-4o"
 LOG_FILE   = "predictions_log.csv"
 MODEL_FILE = "bet_model_tuned.pkl"
 
-# City → (lat, lon, ICAO)
 CITY_COORDS = {
     "LA":        (34.05, -118.25, "KLAX"),
     "New York": (40.71,  -74.01, "KJFK"),
     "Miami":     (25.77,  -80.19, "KMIA"),
 }
 
-# ============ OCR & SIGNAL FUNCTIONS ============
+# ============ OCR & SIGNALS ============
 
 def extract_text(img_bytes: bytes) -> str:
     return pytesseract.image_to_string(Image.open(io.BytesIO(img_bytes)))
 
 def get_weather_ensemble(city: str):
     temps = []
-    # OpenWeather 24h high
     try:
         r = requests.get(
             "https://api.openweathermap.org/data/2.5/forecast",
@@ -56,7 +54,6 @@ def get_weather_ensemble(city: str):
         temps.append(max(e["main"]["temp"] for e in block))
     except: pass
 
-    # WeatherAPI.com 1-day high
     try:
         r = requests.get(
             "http://api.weatherapi.com/v1/forecast.json",
@@ -89,7 +86,7 @@ def get_precip_nowcast(city: str) -> float:
         ).json()
         iv = r["data"]["timelines"][0]["intervals"]
         cnt = sum(1 for x in iv if x["values"]["precipitationIntensity"] > 0.02)
-        return cnt / len(iv)
+        return cnt/len(iv)
     except:
         return 0.0
 
@@ -105,17 +102,17 @@ def get_hrrr_nowcast(city: str) -> float:
     )
     try:
         ds   = Dataset(url)
-        refl = ds.variables["REFL_L8"]    # [time,lat,lon]
+        refl = ds.variables["REFL_L8"]
         lats = ds.variables["lat"][:]
         lons = ds.variables["lon"][:]
         i = np.abs(lats - lat).argmin()
         j = np.abs(lons - lon).argmin()
-        radar = refl[1, :, :]             # 1-h forecast
+        radar = refl[1,:,:]
         win   = radar[
-            max(0, i-2):min(i+3, radar.shape[0]),
-            max(0, j-2):min(j+3, radar.shape[1])
+            max(0,i-2):min(i+3,radar.shape[0]),
+            max(0,j-2):min(j+3,radar.shape[1])
         ]
-        pct = float(np.mean(win > 30.0))  # >30 dBZ
+        pct = float(np.mean(win > 30.0))
         ds.close()
         return pct
     except:
@@ -134,29 +131,26 @@ def get_metar(city: str):
     except:
         return None, None, None
 
-# ============ AUTOMATIC HYPERPARAMETER TUNING & RETRAINING ============
+# ============ AUTOMATIC HYPERPARAMETER TUNING ============
 
 def train_ml_model():
     if not os.path.exists(LOG_FILE):
         return None, None
-
     df = pd.read_csv(LOG_FILE).dropna(subset=["actual_outcome"])
     if len(df) < 10:
         return None, None
 
-    # features
     df["nowcast_pct_f"]    = df["nowcast_pct"].astype(float)
     df["blend_conf_f"]     = df["blend_conf"].astype(float)
     df["weather_avg_f"]    = df["weather_avg"].astype(float)
     df["weather_spread_f"] = df["weather_spread"].astype(float)
     df["market_yes_pct_f"] = df["market_yes_pct"].astype(float)
-    df["side_bin"]         = (df["gpt_side"] == "Yes").astype(int)
-    df["win"]              = ((df["gpt_range"] == df["actual_outcome"]) & (df["side_bin"]==1)).astype(int)
+    df["side_bin"]         = (df["gpt_side"]=="Yes").astype(int)
+    df["win"]              = ((df["gpt_range"]==df["actual_outcome"]) & (df["side_bin"]==1)).astype(int)
 
     X = df[["weather_avg_f","weather_spread_f","nowcast_pct_f","blend_conf_f","market_yes_pct_f","side_bin"]]
     y = df["win"]
-
-    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42)
+    Xtr, Xte, ytr, yte = train_test_split(X,y,test_size=0.2,random_state=42)
 
     param_dist = {
         "n_estimators":    [100,200,300,400],
@@ -172,33 +166,37 @@ def train_ml_model():
         n_iter=20, cv=3, scoring="accuracy",
         n_jobs=-1, random_state=42
     )
-    search.fit(Xtr, ytr)
+    search.fit(Xtr,ytr)
     best = search.best_estimator_
-    acc  = best.score(Xte, yte)
-
+    acc  = best.score(Xte,yte)
     joblib.dump(best, MODEL_FILE)
     return best, acc
 
-# ============ GPT PROMPTING ============
+# ============ VALUE-BASED GPT PROMPT ============
 
-def ask_gpt(question: str, confidence: float) -> str:
+def ask_gpt_value(city, weather_summary, confidence, market_probs):
     prompt = textwrap.dedent(f"""
         You are a prediction-market analyst.
-        Final blended confidence: {confidence:.1f}%.
+        Market: Highest temperature in {city}.
 
-        Market Question:
-        {question}
+        Signals:
+        {weather_summary}
+        Blended confidence for “Yes” on a given range: {confidence:.1f}%.
 
-        Reply exactly:
-        Range: [e.g. 75°–76°]
-        Side: [Yes or No]
+        Market probabilities:
+        {market_probs}
+
+        Identify which outcome is underpriced (i.e. where your blended confidence exceeds the market price).
+        Respond exactly in this format:
+        Range: [e.g. 78° or above]
+        Side: Yes
         Probability: [xx%]
         Reasoning: [one sentence]
     """).strip()
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role":"system","content":"Be concise and clear."},
+            {"role":"system","content":"Be concise and pick value."},
             {"role":"user","content":prompt}
         ],
         temperature=0.3,
@@ -207,62 +205,76 @@ def ask_gpt(question: str, confidence: float) -> str:
     return resp.choices[0].message.content.strip()
 
 def parse_reply(txt: str):
-    out = {"Range":"","Side":"","Probability":"","Reasoning":""}
+    out={"Range":"","Side":"","Probability":"","Reasoning":""}
     for L in txt.splitlines():
         for k in out:
             if L.lower().startswith(k.lower()+":"):
-                out[k] = L.split(":",1)[1].strip()
+                out[k]=L.split(":",1)[1].strip()
     return out
 
 # ============ BOOTSTRAP & UI ============
 
-with st.spinner("🔧 Tuning & retraining model…"):
+with st.spinner("🔧 Tuning model…"):
     clf, ml_acc = train_ml_model()
 
-rows    = sum(1 for _ in open(LOG_FILE)) - 1 if os.path.exists(LOG_FILE) else 0
+rows    = sum(1 for _ in open(LOG_FILE)) -1 if os.path.exists(LOG_FILE) else 0
 base_acc = ml_acc if ml_acc is not None else 0.72
-ev_day   = (2*base_acc - 1)*100
-ev_mon   = ev_day * 30
+ev_day   = (2*base_acc -1)*100
+ev_mon   = ev_day*30
 
-st.metric("📊 Logged rows", rows)
+st.metric("📊 Rows logged", rows)
 if ml_acc is not None:
     st.metric("🤖 ML accuracy", f"{ml_acc*100:.1f}%")
 st.metric("🔮 Est. accuracy", f"{base_acc*100:.1f}%")
 st.metric("💵 EV/day (@100)", f"${ev_day:.1f}", delta=f"${ev_mon:.0f}/mo")
 
-st.title("🌡️ Temp-Only Sniper v3")
+st.title("🌡️ Temp-Only Sniper v3 (Value Pick)")
 st.markdown("Upload a screenshot of “Highest temperature in X” (LA/NYC/Miami).")
 
-up = st.file_uploader("PNG/JPG screenshot", type=["png","jpg","jpeg"])
+up = st.file_uploader("PNG/JPG", type=["png","jpg","jpeg"])
 if st.button("Analyze") and up:
     text = extract_text(up.read())
     st.subheader("📝 Extracted Text")
     st.write(text)
 
     if "highest temperature" not in text.lower():
-        st.error("This bot only handles Highest temperature markets.")
+        st.error("Only ‘Highest temperature’ markets supported.")
     else:
         city = next((c for c in CITY_COORDS if c.lower() in text.lower()), "")
         if not city:
             st.error("Only LA, New York or Miami supported.")
         else:
-            (avg, spread, temps), raw = get_weather_ensemble(city)
+            (avg,spread,temps),raw = get_weather_ensemble(city)
             nowc = get_precip_nowcast(city)
             hrrr = get_hrrr_nowcast(city)
-            mt, dp, ws = get_metar(city)
+            mt,dp,ws = get_metar(city)
 
             st.write(f"🌡️ Temps: {temps} → avg {avg}°F, spread {spread:.1f}°")
-            # nowc & hrrr are blended in but not shown
             if mt is not None:
                 st.write(f"✈️ METAR °C: {mt:.1f}, dew {dp:.1f}, wind {ws:.0f} kt")
+
+            # build summary for GPT
+            weather_summary = (
+                f"Forecast avg high: {avg}°F; "
+                f"rain nowcast: {nowc*100:.1f}%; "
+                f"HRRR storm: {hrrr*100:.1f}%; "
+                f"spread: {spread:.1f}°"
+            )
+
+            # strip market lines
+            market_probs = "\n".join(
+                line.strip()
+                for line in text.splitlines()
+                if "%" in line and "Yes" in line
+            )
 
             final_conf = raw*0.6 + nowc*100*0.15 + hrrr*100*0.15
             st.write(f"🎯 Blended confidence: {final_conf:.1f}%")
 
-            raw_reply = ask_gpt(text, final_conf)
+            raw_reply = ask_gpt_value(city, weather_summary, final_conf, market_probs)
             out       = parse_reply(raw_reply)
 
-            st.subheader("🔮 Prediction")
+            st.subheader("🔮 Value Prediction")
             st.write(f"**Range:** {out['Range']}")
             st.write(f"**Side:** {out['Side']}")
             st.write(f"**Probability:** {out['Probability']}")
