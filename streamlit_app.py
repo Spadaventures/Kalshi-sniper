@@ -1,173 +1,143 @@
-import io
-import os
-import threading
 import json
+import threading
 import textwrap
 
 import numpy as np
-import pandas as pd
+import requests
 import streamlit as st
-import pytesseract
-from PIL import Image
 from openai import OpenAI
 import websocket  # pip install websocket-client
 
-# ── CONFIG ─────────────────────────────────────────────────────────────────────
-st.set_page_config("3-City Temp Sniper", layout="wide")
-secrets = st.secrets
-client  = OpenAI(api_key=secrets["OPENAI_API_KEY"])
-MODEL   = "gpt-4o"
+# ── APP CONFIG ─────────────────────────────────────────────────────────────────
+st.set_page_config("Live 3-City Temp Sniper", layout="wide")
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+MODEL  = "gpt-4o"
 
-LOG_FILE    = "predictions_log.csv"
-GFS_FILE    = "gfs_ensemble.csv"
-ECMWF_FILE  = "ecmwf_ensemble.csv"
-
-CITY_COORDS = {
-    "LA":    ("LA Airport",         "KLAX"),
-    "NYC":   ("Central Park, NYC",  "USW00094728"),
-    "MIAMI": ("Miami Int’l Airport","KMIA"),
+# Exact Kalshi market names for the three “Highest temperature…” questions
+CITY_MARKETS = {
+    "LA":    "Highest temperature in Los Angeles Airport tomorrow?",
+    "NYC":   "Highest temperature in Central Park, NYC tomorrow?",
+    "MIAMI": "Highest temperature in Miami Int’l Airport tomorrow?",
 }
 
-# Initialize live‐price storage (no API keys)
-if "live_yes" not in st.session_state:
-    st.session_state["live_yes"] = {name: None for name, _ in CITY_COORDS.values()}
+# Geographic coordinates for each market (for Open-Meteo ensemble)
+CITY_COORDS = {
+    CITY_MARKETS["LA"]:    (33.9425,  -118.4081),
+    CITY_MARKETS["NYC"]:   (40.7812,   -73.9665),
+    CITY_MARKETS["MIAMI"]: (25.7959,   -80.2870),
+}
 
-# ── WEBSOCKET CALLBACKS ─────────────────────────────────────────────────────────
+# Initialize live‐YES% storage
+if "live_yes" not in st.session_state:
+    st.session_state["live_yes"] = {m: None for m in CITY_MARKETS.values()}
+
+
+# ── WEBSOCKET CLIENT (no REST-API keys needed) ─────────────────────────────────
 def on_ws_message(ws, message):
+    """Handle incoming JSON messages: {'market': ..., 'yes': ...}."""
     try:
         data = json.loads(message)
-        market = data.get("market")
-        yes_pct = data.get("yes")
-        if market in st.session_state["live_yes"]:
-            st.session_state["live_yes"][market] = float(yes_pct)
-            # alert if our last_conf beats it
+        m = data.get("market")
+        y = data.get("yes")
+        if m in st.session_state["live_yes"]:
+            st.session_state["live_yes"][m] = float(y)
+            # auto-alert if our last_conf beats the live price
             conf = st.session_state.get("last_conf", 0.0)
-            if conf and conf > yes_pct:
-                st.toast(f"🚨 Edge on {market}: conf {conf:.1f}% > market {yes_pct:.1f}%")
-    except:
+            if conf and conf > y:
+                st.toast(f"🚨 Edge on {m}: conf {conf:.1f}% > market {y:.1f}%")
+    except Exception:
         pass
 
 def on_ws_open(ws):
-    # subscribe to the three markets
+    """Subscribe to the three weather markets as soon as WS opens."""
     for market in st.session_state["live_yes"].keys():
-        sub = {"action": "subscribe", "market": market}
-        ws.send(json.dumps(sub))
+        ws.send(json.dumps({"action": "subscribe", "market": market}))
 
 def start_ws():
     ws = websocket.WebSocketApp(
-        "wss://your-kalshi-websocket-endpoint",  # ← swap with real URL
+        "wss://your-kalshi-websocket-endpoint",  # ← replace with Kalshi's real WS URL
         on_open=on_ws_open,
         on_message=on_ws_message,
     )
     ws.run_forever()
 
-# fire up WS in background
+# run WebSocket in background
 threading.Thread(target=start_ws, daemon=True).start()
 
-# ── OCR & CSV SIGNAL HELPERS ────────────────────────────────────────────────────
-def extract_text(img_bytes):
-    img = Image.open(io.BytesIO(img_bytes))
-    return pytesseract.image_to_string(img).lower()
 
-def load_csv_stats(path):
-    try:
-        df = pd.read_csv(path)
-    except:
-        return {}
-    if "avg" in df.columns and "spread" in df.columns:
-        return df.set_index("city")[["avg","spread"]].to_dict(orient="index")
-    members = [c for c in df.columns if c != "city"]
-    out = {}
-    for _, row in df.iterrows():
-        temps = row[members].astype(float).tolist()
-        out[row["city"]] = {
-            "avg": round(np.mean(temps),1),
-            "spread": round(max(temps)-min(temps),1),
-        }
-    return out
+# ── ENSEMBLE FORECAST FETCHER ───────────────────────────────────────────────────
+def fetch_ensemble_max(lat, lon):
+    """
+    Pulls today’s max-temperature ensemble from GFS & ECMWF via Open-Meteo.
+    Returns (avg_max_F, spread_F).
+    """
+    url = "https://ensemble-api.open-meteo.com/v1/ensemble"
+    params = {
+        "latitude":      lat,
+        "longitude":     lon,
+        "models":        "gfs_ensemble_seamless,ecmwf_ifs_025",
+        "daily":         "temperature_2m_max",
+        "forecast_days": 1,
+        "timezone":      "auto",
+    }
+    js = requests.get(url, params=params, timeout=5).json()
+    temps = js["daily"]["temperature_2m_max"]  # one entry per ensemble member
+    avg    = round(float(np.mean(temps)), 1)
+    spread = round(float(max(temps) - min(temps)), 1)
+    return avg, spread
 
-def get_signal(path):
-    stats = load_csv_stats(path)
-    return {name: stats.get(name,{}) for name, _ in CITY_COORDS.values()}
 
-# ── (Stub) ML TRAINER & GPT PICKER ──────────────────────────────────────────────
-def train_ml_model():
-    # Stub: replace with your retraining logic
-    return None, 0.72
-
-def ask_gpt(city, summary, conf, market):
+# ── GPT PICKER ─────────────────────────────────────────────────────────────────
+def ask_gpt(market, summary, conf, yes_pct):
+    """Ask GPT which side to take based on our confidence vs live price."""
     st.session_state["last_conf"] = conf
     prompt = textwrap.dedent(f"""
-      Market: Highest temperature recorded in {city}.
-      Signals: {summary}
-      Blended confidence: {conf:.1f}%.
-      Market buckets:
-      {market}
-      Pick the bucket where your confidence > market price.
-      Output: Range / Side / Probability.
+        Market: {market}
+        Signals: {summary}
+        Blended confidence: {conf:.1f}%.
+        Live market YES%: {yes_pct:.1f}%.
+        Should I go YES? 
+        Output exactly: Side / Probability.
     """).strip()
+
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role":"system","content":"Be concise."},
-            {"role":"user","content":prompt}
+            {"role": "system", "content": "Be concise — just Side and Probability."},
+            {"role": "user", "content": prompt}
         ],
         temperature=0.2,
-        max_tokens=60
+        max_tokens=20,
     )
     return resp.choices[0].message.content.strip()
 
+
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
-# 1) Top metrics
-_, ml_acc = train_ml_model()
-rows      = sum(1 for _ in open(LOG_FILE)) - 1 if os.path.exists(LOG_FILE) else 0
-ev_day    = (2*ml_acc - 1)*100
+st.title("🌡️ Live 3-City Temp Sniper")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Rows logged",    rows)
-c2.metric("ML accuracy",    f"{ml_acc*100:.1f}%")
-c3.metric("EV/day @ $100",  f"${ev_day:.1f}")
-c4.metric("Live YES% (LA)", st.session_state["live_yes"]["LA Airport"] or "–")
+# 1) Live YES% metrics
+cols = st.columns(3)
+for (code, market), col in zip(CITY_MARKETS.items(), cols):
+    yes = st.session_state["live_yes"][market] or 0.0
+    col.metric(f"{code} Live YES%", f"{yes:.1f}%")
 
-# 2) Ensemble & physics signals summary
-st.subheader("Ensemble Signals")
-gfs   = get_signal(GFS_FILE)
-ecmwf = get_signal(ECMWF_FILE)
-cols  = st.columns(3)
-for col, (code, (name, _)) in zip(cols, CITY_COORDS.items()):
-    col.markdown(f"**{name}**")
-    if gfs.get(name):
-        col.write(f"GFS:   {gfs[name]['avg']}°F ±{gfs[name]['spread']}°")
-    if ecmwf.get(name):
-        col.write(f"ECMWF: {ecmwf[name]['avg']}°F ±{ecmwf[name]['spread']}°")
+# 2) Automatic ensemble forecasts
+st.subheader("GFS+ECMWF Ensemble Forecasts")
+signals = {}
+cols    = st.columns(3)
+for (code, market), col in zip(CITY_MARKETS.items(), cols):
+    lat, lon       = CITY_COORDS[market]
+    avg, spread    = fetch_ensemble_max(lat, lon)
+    signals[market] = {"avg": avg, "spread": spread}
+    col.write(f"Avg max: {avg}°F  |  Spread: ±{spread}°F")
 
-# 3) Screenshot uploader & GPT pick
-st.subheader("Analyze a Kalshi Screenshot")
-up = st.file_uploader("", type=["png","jpg","jpeg"])
-if up:
-    txt = extract_text(up.read())
-    st.text_area("Extracted Text", txt, height=120)
-
-    # route to one of the three cities
-    city = None
-    for code, (name, _) in CITY_COORDS.items():
-        if code.lower() in txt:
-            city = name
-            break
-
-    if not city:
-        st.error("Unsupported market—only LA / NYC / Miami.")
-    else:
-        buckets = "\n".join(
-            line for line in txt.splitlines() if "%" in line and "yes" in line
-        )
-        # placeholder summary + blended confidence (inject your logic here)
-        summary = "Ensemble signals + live market sentiment"
-        conf    = 60.0
-
-        live_yes = st.session_state["live_yes"][city]
-        st.metric("Live Market YES%", live_yes or "–", delta=f"Conf {conf:.1f}%")
-
-        pick = ask_gpt(city, summary, conf, buckets)
-        st.markdown(f"### 🎯 Bot’s Pick for {city}")
-        st.write(pick)
+# 3) Automated GPT picks
+st.subheader("Automated Picks")
+for code, market in CITY_MARKETS.items():
+    sig    = signals[market]
+    raw    = 50 + (sig["avg"] - 75) * 3 - sig["spread"] * 2
+    conf   = float(np.clip(raw, 10, 99))
+    yes_pct= st.session_state["live_yes"][market] or 0.0
+    summary= f"Ensemble avg {sig['avg']}°±{sig['spread']}"
+    pick   = ask_gpt(market, summary, conf, yes_pct)
+    st.markdown(f"**{code}** → {pick}  _(Conf: {conf:.1f}%)_")
