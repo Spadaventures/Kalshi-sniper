@@ -1,76 +1,72 @@
-import json
-import threading
-import textwrap
+import json, threading, textwrap
+import numpy as np, requests, streamlit as st, websocket
 
-import numpy as np
-import requests
-import streamlit as st
-from openai import OpenAI
-import websocket  # pip install websocket-client
-
-# ── APP CONFIG ─────────────────────────────────────────────────────────────────
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
 st.set_page_config("Live 3-City Temp Sniper", layout="wide")
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-MODEL  = "gpt-4o"
 
-# Exact Kalshi market names for the three “Highest temperature…” questions
-CITY_MARKETS = {
+# Your three exact question strings
+TARGET_QUESTIONS = {
     "LA":    "Highest temperature in Los Angeles Airport tomorrow?",
     "NYC":   "Highest temperature in Central Park, NYC tomorrow?",
     "MIAMI": "Highest temperature in Miami Int’l Airport tomorrow?",
 }
 
-# Geographic coordinates for each market (for Open-Meteo ensemble)
+# Open-Meteo ensemble coords
 CITY_COORDS = {
-    CITY_MARKETS["LA"]:    (33.9425,  -118.4081),
-    CITY_MARKETS["NYC"]:   (40.7812,   -73.9665),
-    CITY_MARKETS["MIAMI"]: (25.7959,   -80.2870),
+    "LA":    (33.9425,  -118.4081),
+    "NYC":   (40.7812,   -73.9665),
+    "MIAMI": (25.7959,   -80.2870),
 }
 
-# Initialize live‐YES% storage
+# Streaming URL for Kalshi’s public feed
+WS_URL = "wss://stream.kalshi.com/v1/feed"  # ← Kalshi’s official events & price feed
+
+# state
+if "market_ids" not in st.session_state:
+    st.session_state["market_ids"] = {}       # question -> id
 if "live_yes" not in st.session_state:
-    st.session_state["live_yes"] = {m: None for m in CITY_MARKETS.values()}
+    st.session_state["live_yes"] = {}         # id -> yes%
 
+# ── WEBSOCKET HANDLER ──────────────────────────────────────────────────────────
+def on_message(ws, message):
+    msg = json.loads(message)
+    # --- 1) initial “Event” message with market definitions
+    if "markets" in msg:
+        for m in msg["markets"]:
+            q = m.get("question")
+            if q and q in TARGET_QUESTIONS.values():
+                st.session_state["market_ids"][q] = m["id"]
+                # now subscribe to its price updates:
+                ws.send(json.dumps({
+                    "action":    "subscribe",
+                    "market_id": m["id"],
+                    "channel":   "orderbook"   # or “prices” if supported
+                }))
+    # --- 2) orderbook / price update
+    elif msg.get("channel") in ("orderbook","prices"):
+        mid = msg.get("market_id")
+        yes = msg.get("yes")
+        if mid and yes is not None:
+            st.session_state["live_yes"][mid] = float(yes)
 
-# ── WEBSOCKET CLIENT (no REST-API keys needed) ─────────────────────────────────
-def on_ws_message(ws, message):
-    """Handle incoming JSON messages: {'market': ..., 'yes': ...}."""
-    try:
-        data = json.loads(message)
-        m = data.get("market")
-        y = data.get("yes")
-        if m in st.session_state["live_yes"]:
-            st.session_state["live_yes"][m] = float(y)
-            # auto-alert if our last_conf beats the live price
-            conf = st.session_state.get("last_conf", 0.0)
-            if conf and conf > y:
-                st.toast(f"🚨 Edge on {m}: conf {conf:.1f}% > market {y:.1f}%")
-    except Exception:
-        pass
+def on_open(ws):
+    # Kick off by subscribing to the master “all markets” feed
+    ws.send(json.dumps({"action":"subscribe","channel":"markets"}))
 
-def on_ws_open(ws):
-    """Subscribe to the three weather markets as soon as WS opens."""
-    for market in st.session_state["live_yes"].keys():
-        ws.send(json.dumps({"action": "subscribe", "market": market}))
-
-def start_ws():
+def run_ws():
     ws = websocket.WebSocketApp(
-        "wss://your-kalshi-websocket-endpoint",  # ← replace with Kalshi's real WS URL
-        on_open=on_ws_open,
-        on_message=on_ws_message,
+        WS_URL,
+        on_open=on_open,
+        on_message=on_message
     )
     ws.run_forever()
 
-# run WebSocket in background
-threading.Thread(target=start_ws, daemon=True).start()
+# start in background
+threading.Thread(target=run_ws, daemon=True).start()
 
 
-# ── ENSEMBLE FORECAST FETCHER ───────────────────────────────────────────────────
+# ── FORECAST SIGNAL ────────────────────────────────────────────────────────────
 def fetch_ensemble_max(lat, lon):
-    """
-    Pulls today’s max-temperature ensemble from GFS & ECMWF via Open-Meteo.
-    Returns (avg_max_F, spread_F).
-    """
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
     params = {
         "latitude":      lat,
@@ -80,64 +76,38 @@ def fetch_ensemble_max(lat, lon):
         "forecast_days": 1,
         "timezone":      "auto",
     }
-    js = requests.get(url, params=params, timeout=5).json()
-    temps = js["daily"]["temperature_2m_max"]  # one entry per ensemble member
-    avg    = round(float(np.mean(temps)), 1)
-    spread = round(float(max(temps) - min(temps)), 1)
-    return avg, spread
-
-
-# ── GPT PICKER ─────────────────────────────────────────────────────────────────
-def ask_gpt(market, summary, conf, yes_pct):
-    """Ask GPT which side to take based on our confidence vs live price."""
-    st.session_state["last_conf"] = conf
-    prompt = textwrap.dedent(f"""
-        Market: {market}
-        Signals: {summary}
-        Blended confidence: {conf:.1f}%.
-        Live market YES%: {yes_pct:.1f}%.
-        Should I go YES? 
-        Output exactly: Side / Probability.
-    """).strip()
-
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": "Be concise — just Side and Probability."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-        max_tokens=20,
-    )
-    return resp.choices[0].message.content.strip()
+    js    = requests.get(url, params=params, timeout=5).json()
+    temps = js["daily"]["temperature_2m_max"]
+    return round(float(np.mean(temps)),1), round(float(max(temps)-min(temps)),1)
 
 
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
 st.title("🌡️ Live 3-City Temp Sniper")
 
-# 1) Live YES% metrics
+# 1️⃣ Show live YES% & pick the top-priced bucket
 cols = st.columns(3)
-for (code, market), col in zip(CITY_MARKETS.items(), cols):
-    yes = st.session_state["live_yes"][market] or 0.0
-    col.metric(f"{code} Live YES%", f"{yes:.1f}%")
+for (code, question), col in zip(TARGET_QUESTIONS.items(), cols):
+    mid = st.session_state["market_ids"].get(question)
+    yes = st.session_state["live_yes"].get(mid, 0.0) if mid else 0.0
+    label = f"{code} → {yes:.1f}% YES" if mid else f"{code} → discovering…"
+    col.metric(label, "")
 
-# 2) Automatic ensemble forecasts
-st.subheader("GFS+ECMWF Ensemble Forecasts")
+# 2️⃣ Show GFS+ECMWF ensemble forecasts
+st.subheader("Ensemble Forecasts")
+cols = st.columns(3)
 signals = {}
-cols    = st.columns(3)
-for (code, market), col in zip(CITY_MARKETS.items(), cols):
-    lat, lon       = CITY_COORDS[market]
-    avg, spread    = fetch_ensemble_max(lat, lon)
-    signals[market] = {"avg": avg, "spread": spread}
-    col.write(f"Avg max: {avg}°F  |  Spread: ±{spread}°F")
+for code, question in TARGET_QUESTIONS.items():
+    lat, lon = CITY_COORDS[code]
+    avg, spread = fetch_ensemble_max(lat, lon)
+    signals[code] = (avg, spread)
+    cols[list(TARGET_QUESTIONS).index(code)].write(f"Avg max: {avg}°F | Spread: ±{spread}°F")
 
-# 3) Automated GPT picks
-st.subheader("Automated Picks")
-for code, market in CITY_MARKETS.items():
-    sig    = signals[market]
-    raw    = 50 + (sig["avg"] - 75) * 3 - sig["spread"] * 2
-    conf   = float(np.clip(raw, 10, 99))
-    yes_pct= st.session_state["live_yes"][market] or 0.0
-    summary= f"Ensemble avg {sig['avg']}°±{sig['spread']}"
-    pick   = ask_gpt(market, summary, conf, yes_pct)
-    st.markdown(f"**{code}** → {pick}  _(Conf: {conf:.1f}%)_")
+# 3️⃣ Simple “edge” recommendation
+st.subheader("Edge Recommendation")
+for code, question in TARGET_QUESTIONS.items():
+    mid = st.session_state["market_ids"].get(question)
+    yes = st.session_state["live_yes"].get(mid, 0.0) if mid else 0.0
+    avg, spread = signals[code]
+    conf = np.clip(50 + (avg-75)*3 - spread*2, 10, 99)
+    side = "YES" if yes > conf else "NO"
+    st.write(f"**{code}**: go **{side}** (live: {yes:.1f}% vs conf: {conf:.1f}%)")
