@@ -1,5 +1,1 @@
-pipinstall 
-streamlit 
-numpy 
-requests 
-websocket-client
+websocket-client>=1.5.1
