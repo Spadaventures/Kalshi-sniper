@@ -1,4 +1,5 @@
-streamlit
-numpy
-requests
+pip install 
+streamlit 
+numpy 
+requests 
 websocket-client
