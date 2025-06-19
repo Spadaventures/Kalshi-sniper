@@ -1,71 +1,76 @@
-import time
-import jwt                     # PyJWT
-import requests
 import streamlit as st
+import requests
+from bs4 import BeautifulSoup
+import re
 
-# ───────── Streamlit page config ─────────
 st.set_page_config(
     page_title="🌡️ 3-City Temp Sniper",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    layout="centered",
+    initial_sidebar_state="collapsed",
 )
 
-# ───────── Secrets ─────────
-OPENAI_API_KEY     = st.secrets["OPENAI_API_KEY"]      # if you ever use it
-KALSHI_KEY_ID      = st.secrets["KALSHI_KEY_ID"]
-KALSHI_PRIVATE_KEY = st.secrets["KALSHI_PRIVATE_KEY"]
+st.markdown("""
+<style>
+  .block-container { max-width: 480px; margin: auto; padding: 1rem; }
+  .stHeader { text-align: center; }
+  .city { font-size: 1.2rem; margin-bottom: 0.25rem; }
+  .pred { font-weight: bold; font-size: 1rem; }
+  .conf { color: #2E86C1; }
+</style>
+""", unsafe_allow_html=True)
 
-# ───────── Markets ─────────
-MARKETS = {
-    "kxhighlax": "Los Angeles (KLAX)",
-    "kxhighny":  "New York (Central Park)",
-    "kxhighmia": "Miami (KMIA)",
-}
+st.title("🌡️ 3-City Temp Sniper")
+st.markdown("Live **best YES bid** for each highest-temp market, refreshed on load.")
 
-# ───────── Helpers ─────────
-def make_kalshi_jwt() -> str:
-    """Generate a 60-second RS256 JWT for Kalshi REST calls."""
-    now = int(time.time())
-    payload = {"sub": KALSHI_KEY_ID, "iat": now, "exp": now + 60}
-    return jwt.encode(payload, KALSHI_PRIVATE_KEY, algorithm="RS256")
+TICKERS = st.secrets["KALSHI_TICKERS"]
+BASE_URL = "https://kalshi.com/markets/{ticker}/"
 
 @st.cache_data(ttl=30)
-def fetch_yes_bids(market_ticker: str):
-    """Fetch a one-off order-book snapshot and return the YES side levels."""
-    token = make_kalshi_jwt()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "X-Api-Key": KALSHI_KEY_ID
-    }
-    url = f"https://api.elections.kalshi.com/trade-api/v2/markets/{market_ticker}/orderbook"
-    resp = requests.get(url, headers=headers, timeout=5)
-    resp.raise_for_status()
-    # Kalshi returns {"msg": {...}}
-    return resp.json().get("msg", {}).get("yes", [])
+def fetch_yes_percentages(ticker: str):
+    """Scrape Kalshi public page for the three ranges' YES %. Returns dict {range: yes_pct}."""
+    url = BASE_URL.format(ticker=ticker)
+    r = requests.get(url, timeout=5)
+    r.raise_for_status()
+    html = r.text
 
-# ───────── UI ─────────
-st.title("🌡️ 3-City Temp Sniper")
-st.markdown("Live “best YES bid” for each highest-temp market, refreshed every 30 s.")
+    # find the three label/value pairs under "Make your prediction"
+    # We'll use a regex to capture e.g. '76° to 77°  22% Yes'
+    pattern = re.compile(r'(\d{1,2}°(?: to \d{1,2}°| or above))\D+?(\d{1,3})% Yes', re.IGNORECASE)
+    matches = pattern.findall(html)
 
-for ticker, desc in MARKETS.items():
-    st.subheader(desc)
+    # build dict
+    out = {}
+    for rng, pct in matches:
+        out[rng] = float(pct)
+    return out
+
+def pick_best(preds: dict):
+    """Given {range: pct}, return (best_range, best_pct)."""
+    if not preds:
+        return None, 0.0
+    best = max(preds.items(), key=lambda kv: kv[1])
+    return best  # (range, pct)
+
+# Layout
+for ticker in TICKERS:
+    # map ticker → display name
+    name = {
+        "kxhighlax": "Los Angeles (KLAX)",
+        "kxhighny": "New York (Central Park)",
+        "kxhighmia": "Miami (KMIA)"
+    }.get(ticker, ticker)
+
+    st.markdown(f"#### {name}")
     try:
-        yes_levels = fetch_yes_bids(ticker)
+        yes_map = fetch_yes_percentages(ticker)
+        best_range, best_pct = pick_best(yes_map)
+        if best_range:
+            st.markdown(f"- 🔮 **Bet on** `{best_range}`")
+            st.markdown(f"- 📈 **Confidence**: <span class='conf'>{best_pct:.1f}%</span>", unsafe_allow_html=True)
+        else:
+            st.info("No YES bids currently available")
     except Exception as e:
-        st.error(f"❌ Failed to fetch {ticker}: {e}")
-        continue
+        st.error(f"Error loading market: {e}")
 
-    if not yes_levels:
-        st.info("— no YES bids currently available —")
-        continue
-
-    # pick the highest bid price
-    best_price, best_size = max(yes_levels, key=lambda lvl: lvl[0])
-    st.markdown(f"""
-**Best YES bid:** **{best_price:.1f}%**  
-Contracts at that level: **{best_size}**  
-👉 **Recommendation**: Bet YES on “highest temp ≥ strike” at **{best_price:.1f}%**
-""")
-    st.divider()
-
-st.caption("Data via Kalshi REST snapshot (cached 30 s).")
+st.markdown("---")
+st.markdown("• Data cached 30 s • Source: Kalshi public pages")
