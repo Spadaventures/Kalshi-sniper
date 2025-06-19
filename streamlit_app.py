@@ -1,125 +1,129 @@
-import json, threading, textwrap
-import numpy as np, requests, streamlit as st, websocket
+# streamlit_app.py
+
+import json
+import threading
+
+import numpy as np
+import requests
+import streamlit as st
+import websocket  # pip install websocket-client
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 st.set_page_config("Live 3-City Temp Sniper", layout="wide")
 
-# Your three exact Kalshi questions
-QUESTIONS = {
-    "LA":    "Highest temperature in Los Angeles Airport tomorrow?",
-    "NYC":   "Highest temperature in Central Park, NYC tomorrow?",
-    "MIAMI": "Highest temperature in Miami Int’l Airport tomorrow?",
+# Your three public Kalshi market slugs (no secret keys needed)
+MARKET_IDS = {
+    "LA":    "kxhighlax",
+    "NYC":   "kxhighny",
+    "MIAMI": "kxhighmia",
 }
 
-# Coords for ensemble forecast (Open-Meteo)
+# Fixed outcome ranges for each market (in the same order Kalshi shows them)
+OUTCOME_RANGES = {
+    "LA":    ["74° to 75°", "76° to 77°", "78° or above"],
+    "NYC":   ["79° to 80°", "81° to 82°", "83° or above"],
+    "MIAMI": ["84° to 85°", "86° to 87°", "88° or above"],
+}
+
+# Coordinates for tomorrow’s max-temp ensemble
 COORDS = {
     "LA":    (33.9425,  -118.4081),
     "NYC":   (40.7812,   -73.9665),
     "MIAMI": (25.7959,   -80.2870),
 }
 
-# Public Kalshi WS endpoint
+# Kalshi’s public WebSocket endpoint
 WS_URL = "wss://stream.kalshi.com/v1/feed"
 
-# Storage for discovered markets & live prices
-if "markets" not in st.session_state:
-    st.session_state["markets"] = {code: [] for code in QUESTIONS}
+# In-memory store for live YES% per market slug
 if "live_yes" not in st.session_state:
-    st.session_state["live_yes"] = {}   # market_id -> yes%
+    st.session_state["live_yes"] = {slug: 0.0 for slug in MARKET_IDS.values()}
 
-# ── WEBSOCKET CALLBACKS ─────────────────────────────────────────────────────────
+
+# ── WEBSOCKET CLIENT ────────────────────────────────────────────────────────────
 def on_message(ws, message):
     msg = json.loads(message)
-
-    # 1) initial market definitions
-    if "markets" in msg:
-        for m in msg["markets"]:
-            q = m.get("question")
-            # match our three questions
-            for code, text in QUESTIONS.items():
-                if q == text:
-                    st.session_state["markets"][code].append({
-                        "id":      m["id"],
-                        "outcome": m["outcome"]
-                    })
-                    # subscribe to price for that outcome
-                    ws.send(json.dumps({
-                        "action":    "subscribe",
-                        "channel":   "prices",
-                        "market_id": m["id"]
-                    }))
-
-    # 2) price update
-    if msg.get("channel") == "prices" and "yes" in msg:
-        mid = msg["market_id"]
-        st.session_state["live_yes"][mid] = float(msg["yes"])
+    # price updates come over "prices" channel
+    if msg.get("channel") == "prices" and "market" in msg and "yes" in msg:
+        slug = msg["market"]
+        st.session_state["live_yes"][slug] = float(msg["yes"])
 
 def on_open(ws):
-    # kick off market discovery
-    ws.send(json.dumps({"action":"subscribe","channel":"markets"}))
+    # subscribe to each of our three market slugs
+    for slug in MARKET_IDS.values():
+        ws.send(json.dumps({
+            "action":  "subscribe",
+            "channel": "prices",
+            "market":  slug
+        }))
 
 def run_ws():
-    ws = websocket.WebSocketApp(WS_URL, on_open=on_open, on_message=on_message)
+    ws = websocket.WebSocketApp(
+        WS_URL,
+        on_open=on_open,
+        on_message=on_message,
+    )
     ws.run_forever()
 
 threading.Thread(target=run_ws, daemon=True).start()
 
-# ── FORECAST CONFIDENCE ────────────────────────────────────────────────────────
+
+# ── ENSEMBLE CONFIDENCE ────────────────────────────────────────────────────────
 def fetch_confidence(code):
     lat, lon = COORDS[code]
-    # try open-meteo ensemble
+    # try Open-Meteo ensemble
     try:
         resp = requests.get(
             "https://ensemble-api.open-meteo.com/v1/ensemble",
             params={
-              "latitude":lat, "longitude":lon,
-              "models":"gfs_ensemble_seamless,ecmwf_ifs_025",
-              "daily":"temperature_2m_max","forecast_days":1,"timezone":"auto"
-            },timeout=5
+                "latitude":      lat,
+                "longitude":     lon,
+                "models":        "gfs_ensemble_seamless,ecmwf_ifs_025",
+                "daily":         "temperature_2m_max",
+                "forecast_days": 1,
+                "timezone":      "auto",
+            },
+            timeout=5
         ).json()
         temps = resp["daily"]["temperature_2m_max"]
     except Exception:
-        # fallback to OpenWeather 8×3h forecast
+        # fallback to OpenWeather (8 × 3h blocks)
         ow = requests.get(
             f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}"
             f"&appid={st.secrets['WEATHER_API_KEY']}&units=imperial",
             timeout=5
-        ).json()
-        temps = [e["main"]["temp_max"] for e in ow.get("list",[])[:8]]
+        ).json().get("list", [])
+        temps = [b["main"]["temp_max"] for b in ow[:8] if "main" in b]
+
     if not temps:
         return 50.0
     avg    = np.mean(temps)
     spread = max(temps) - min(temps)
-    raw    = 50 + (avg-75)*3 - spread*2
+    raw    = 50 + (avg - 75) * 3 - spread * 2
     return float(np.clip(raw, 10, 99))
+
 
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
 st.title("🌡️ Live 3-City Temp Sniper")
 
-for code in QUESTIONS:
+for code, slug in MARKET_IDS.items():
     st.subheader(code)
-    markets = st.session_state["markets"][code]
-    if not markets:
-        st.info("Discovering markets…")
-        continue
 
-    # build list of (outcome, yes%)
-    rows = []
-    best = (None, -1.0)  # (outcome, yes%)
-    for m in markets:
-        yes = st.session_state["live_yes"].get(m["id"], 0.0)
-        rows.append((m["outcome"], yes))
-        if yes > best[1]:
-            best = (m["outcome"], yes)
+    # live market-wide YES%
+    yes = st.session_state["live_yes"].get(slug, 0.0)
 
-    # compute our confidence
+    # confidence
     conf = fetch_confidence(code)
 
-    # display table
+    # outcome table
     st.table({
-      "Range":        [r[0] for r in rows],
-      "Live YES %":   [f"{r[1]:.1f}%" for r in rows]
+        "Range":        OUTCOME_RANGES[code],
+        "Live YES %":   [f"{yes:.1f}%"] * len(OUTCOME_RANGES[code])
     })
 
-    # recommendation
-    st.markdown(f"**→ Back:** `{best[0]}`  |  **Live YES%:** {best[1]:.1f}%  |  **Conf:** {conf:.1f}%")
+    # recommend the highest bucket if market-wide YES% beats our conf
+    top = OUTCOME_RANGES[code][-1]
+    if yes > conf:
+        st.markdown(f"👉 **Back `{top}`** at **{yes:.1f}%** (conf {conf:.1f}%)")
+    else:
+        st.markdown(f"❌ No edge: market {yes:.1f}% vs conf {conf:.1f}%")
