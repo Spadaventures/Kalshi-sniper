@@ -2,3 +2,4 @@ streamlit
 requests
 numpy
 streamlit-autorefresh
+websocket-client
