@@ -1,59 +1,76 @@
-import re
+# streamlit_app.py
+
 import json
 import threading
+import re
 
 import numpy as np
 import requests
 import streamlit as st
 import websocket  # pip install websocket-client
 
-# ── CONFIG ─────────────────────────────────────────────────────────────────────
+# ── 0) CONFIG ───────────────────────────────────────────────────────────────────
 st.set_page_config("Live 3-City Temp Sniper", layout="wide")
 
-# The three “parent” market URLs you provided
-PARENTS = {
+# Your three parent-market URLs:
+PARENT_URLS = {
     "LA":    "https://kalshi.com/markets/kxhighlax/highest-temperature-in-los-angeles#kxhighlax-25jun19",
     "NYC":   "https://kalshi.com/markets/kxhighny/highest-temperature-in-nyc#kxhighny-25jun19",
     "MIAMI": "https://kalshi.com/markets/kxhighmia/highest-temperature-in-miami#kxhighmia-25jun19",
 }
 
-# Geographic coords for tomorrow’s max-temp ensemble
+# Coordinates for tomorrow’s max-temp ensemble
 COORDS = {
     "LA":    (33.9425,  -118.4081),
     "NYC":   (40.7812,   -73.9665),
     "MIAMI": (25.7959,   -80.2870),
 }
 
-# Public Kalshi WebSocket endpoint
 WS_URL = "wss://stream.kalshi.com/v1/feed"
 
-# In-memory stores
+# State
 if "outcomes" not in st.session_state:
-    st.session_state["outcomes"] = {}      # city -> list of outcome slugs
+    st.session_state["outcomes"] = {}   # city → [slug,…]
 if "live_yes" not in st.session_state:
-    st.session_state["live_yes"] = {}      # slug -> live YES%
+    st.session_state["live_yes"] = {}   # slug → float
 
-# ── 1) Discover each page’s 3 outcome-slugs ────────────────────────────────────
-def discover(city, url):
-    parent_slug = url.split("/markets/")[1].split("#")[0]
+# ── 1) DISCOVER OUTCOME SLUGS VIA __NEXT_DATA__ ─────────────────────────────────
+def discover_slugs(url):
+    """Fetch the HTML, parse Next.js JSON, extract all outcome slugs."""
     html = requests.get(url, timeout=5).text
-    candidates = set(re.findall(r'href="/markets/([^"/]+)"', html))
-    slugs = sorted(s for s in candidates if s.startswith(parent_slug + "-"))
+
+    m = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
+        html,
+        flags=re.DOTALL
+    )
+    if not m:
+        return []
+
+    data = json.loads(m.group(1))
+    # drill into pageProps → market → outcomes
+    market = data.get("props", {}) \
+                 .get("pageProps", {}) \
+                 .get("market", {})
+    outcomes = market.get("outcomes", [])
+    slugs = [o["slug"] for o in outcomes if "slug" in o]
+    # init live_yes
     for s in slugs:
         st.session_state["live_yes"].setdefault(s, 0.0)
     return slugs
 
-for city, url in PARENTS.items():
+# run discovery once per city
+for city, url in PARENT_URLS.items():
     if city not in st.session_state["outcomes"]:
-        st.session_state["outcomes"][city] = discover(city, url)
+        st.session_state["outcomes"][city] = discover_slugs(url)
 
-# ── 2) WebSocket → live YES% for each outcome slug ──────────────────────────────
-def on_message(ws, message):
-    msg = json.loads(message)
+# ── 2) WEBSOCKET FOR LIVE YES% ───────────────────────────────────────────────────
+def _on_message(ws, raw):
+    msg = json.loads(raw)
     if msg.get("channel") == "prices" and "market" in msg and "yes" in msg:
         st.session_state["live_yes"][msg["market"]] = float(msg["yes"])
 
-def on_open(ws):
+def _on_open(ws):
     for slugs in st.session_state["outcomes"].values():
         for slug in slugs:
             ws.send(json.dumps({
@@ -62,14 +79,18 @@ def on_open(ws):
                 "market":  slug
             }))
 
-def run_ws():
-    ws = websocket.WebSocketApp(WS_URL, on_open=on_open, on_message=on_message)
+def _ws_runner():
+    ws = websocket.WebSocketApp(
+        WS_URL,
+        on_open=_on_open,
+        on_message=_on_message
+    )
     ws.run_forever()
 
-threading.Thread(target=run_ws, daemon=True).start()
+threading.Thread(target=_ws_runner, daemon=True).start()
 
-# ── 3) Compute a physics-based confidence score ──────────────────────────────────
-def get_conf(city):
+# ── 3) ENSEMBLE CONFIDENCE (Open-Meteo) ──────────────────────────────────────────
+def get_confidence(city):
     lat, lon = COORDS[city]
     try:
         r = requests.get(
@@ -80,7 +101,7 @@ def get_conf(city):
                 "models":        "gfs_ensemble_seamless,ecmwf_ifs_025",
                 "daily":         "temperature_2m_max",
                 "forecast_days": 1,
-                "timezone":      "auto"
+                "timezone":      "auto",
             },
             timeout=5
         ).json()
@@ -90,42 +111,41 @@ def get_conf(city):
 
     if not temps:
         return 50.0
-
     avg    = np.mean(temps)
     spread = max(temps) - min(temps)
     raw    = 50 + (avg - 75) * 3 - spread * 2
     return float(np.clip(raw, 10, 99))
 
-# ── 4) DASHBOARD ───────────────────────────────────────────────────────────────
+# ── 4) DASHBOARD ────────────────────────────────────────────────────────────────
 st.title("🌡️ Live 3-City Temp Sniper")
 
 for city, slugs in st.session_state["outcomes"].items():
     st.subheader(city)
 
-    # Gather live YES% for each slug
-    yes_list = [st.session_state["live_yes"].get(s, 0.0) for s in slugs]
-
-    # If discovery hasn't run yet or no slugs found, show info
+    # if discovery failed
     if not slugs:
-        st.info("🔍 Scanning for outcome buckets…")
+        st.info("⚙️ Still fetching that city’s outcome buckets…")
         continue
 
-    # Display table of ranges + live percentages
+    # gather live YES%
+    yes_list = [st.session_state["live_yes"].get(s, 0.0) for s in slugs]
+
+    # display the table
     st.table({
         "Outcome Slug": slugs,
         "Live YES %":   [f"{v:.1f}%" for v in yes_list]
     })
 
-    # Compute best index safely
-    best_idx = max(range(len(yes_list)), key=lambda i: yes_list[i])
-    best_slug = slugs[best_idx]
-    best_yes  = yes_list[best_idx]
+    # pick best bucket
+    best_i    = max(range(len(yes_list)), key=lambda i: yes_list[i])
+    best_slug = slugs[best_i]
+    best_yes  = yes_list[best_i]
 
-    # Compute confidence
-    conf = get_conf(city)
+    # compute confidence
+    conf = get_confidence(city)
 
-    # Render recommendation
+    # recommendation
     if best_yes > conf:
-        st.markdown(f"👉 **Back `{best_slug}`** @ **{best_yes:.1f}%**  (Conf {conf:.1f}%)")
+        st.markdown(f"👉 **Back `{best_slug}`**  @ **{best_yes:.1f}%**  (Conf {conf:.1f}%)")
     else:
         st.markdown(f"❌ No edge: best `{best_slug}` @ {best_yes:.1f}% vs Conf {conf:.1f}%")
