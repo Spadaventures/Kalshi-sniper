@@ -1,76 +1,75 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-import re
+import json
 
+# ─── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="🌡️ 3-City Temp Sniper",
     layout="centered",
-    initial_sidebar_state="collapsed",
 )
 
-st.markdown("""
-<style>
-  .block-container { max-width: 480px; margin: auto; padding: 1rem; }
-  .stHeader { text-align: center; }
-  .city { font-size: 1.2rem; margin-bottom: 0.25rem; }
-  .pred { font-weight: bold; font-size: 1rem; }
-  .conf { color: #2E86C1; }
-</style>
-""", unsafe_allow_html=True)
-
 st.title("🌡️ 3-City Temp Sniper")
-st.markdown("Live **best YES bid** for each highest-temp market, refreshed on load.")
+st.markdown("Live **Bet Recommendation** for daily highest-temp markets (auto-refresh every time you hit Refresh).")
 
-TICKERS = st.secrets["KALSHI_TICKERS"]
-BASE_URL = "https://kalshi.com/markets/{ticker}/"
+# ─── Load your three tickers from secrets ────────────────────────────────────────
+TICKERS = st.secrets["KALSHI_TICKERS"]  # e.g. ["kxhighlax","kxhighny","kxhighmia"]
+NAME_MAP = {
+    "kxhighlax": "Los Angeles (KLAX)",
+    "kxhighny":  "New York (Central Park)",
+    "kxhighmia": "Miami (KMIA)",
+}
 
-@st.cache_data(ttl=30)
-def fetch_yes_percentages(ticker: str):
-    """Scrape Kalshi public page for the three ranges' YES %. Returns dict {range: yes_pct}."""
-    url = BASE_URL.format(ticker=ticker)
-    r = requests.get(url, timeout=5)
-    r.raise_for_status()
-    html = r.text
+def fetch_yes_percentages(ticker: str) -> dict[str, float]:
+    """
+    Scrape Kalshi public market page to extract each outcome's best YES-bid %
+    Returns a dict mapping "74° to 75°" → 33.7, etc.
+    """
+    url = f"https://kalshi.com/markets/{ticker}"
+    resp = requests.get(url)
+    resp.raise_for_status()
 
-    # find the three label/value pairs under "Make your prediction"
-    # We'll use a regex to capture e.g. '76° to 77°  22% Yes'
-    pattern = re.compile(r'(\d{1,2}°(?: to \d{1,2}°| or above))\D+?(\d{1,3})% Yes', re.IGNORECASE)
-    matches = pattern.findall(html)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    script = soup.find("script", id="__NEXT_DATA__")
+    if not script or not script.string:
+        raise RuntimeError("Could not find Next.js data blob on page")
 
-    # build dict
-    out = {}
-    for rng, pct in matches:
-        out[rng] = float(pct)
-    return out
+    data = json.loads(script.string)
+    outcomes = data["props"]["pageProps"]["market"]["outcomes"]
+    yes_map: dict[str, float] = {}
 
-def pick_best(preds: dict):
-    """Given {range: pct}, return (best_range, best_pct)."""
-    if not preds:
+    for o in outcomes:
+        label = o.get("name")             # e.g. "78° or above"
+        best_bid = o.get("bestBid")       # a float between 0 and 1
+        if label and isinstance(best_bid, (float, int)):
+            yes_map[label] = best_bid * 100
+
+    return yes_map
+
+def pick_best(yes_map: dict[str, float]) -> tuple[str, float]:
+    """
+    From outcome→pct, returns (best_outcome, best_pct).
+    If empty, returns (None, 0.0).
+    """
+    if not yes_map:
         return None, 0.0
-    best = max(preds.items(), key=lambda kv: kv[1])
-    return best  # (range, pct)
+    best_label, best_pct = max(yes_map.items(), key=lambda kv: kv[1])
+    return best_label, best_pct
 
-# Layout
+# ─── Main display loop ─────────────────────────────────────────────────────────
 for ticker in TICKERS:
-    # map ticker → display name
-    name = {
-        "kxhighlax": "Los Angeles (KLAX)",
-        "kxhighny": "New York (Central Park)",
-        "kxhighmia": "Miami (KMIA)"
-    }.get(ticker, ticker)
+    display_name = NAME_MAP.get(ticker, ticker)
+    st.header(display_name)
 
-    st.markdown(f"#### {name}")
     try:
         yes_map = fetch_yes_percentages(ticker)
-        best_range, best_pct = pick_best(yes_map)
-        if best_range:
-            st.markdown(f"- 🔮 **Bet on** `{best_range}`")
-            st.markdown(f"- 📈 **Confidence**: <span class='conf'>{best_pct:.1f}%</span>", unsafe_allow_html=True)
-        else:
-            st.info("No YES bids currently available")
-    except Exception as e:
-        st.error(f"Error loading market: {e}")
+        best_label, best_pct = pick_best(yes_map)
 
-st.markdown("---")
-st.markdown("• Data cached 30 s • Source: Kalshi public pages")
+        if best_label:
+            st.markdown(f"- 🔮 **Bet on** `{best_label}`")
+            st.markdown(f"- 📈 **Confidence**: **{best_pct:.1f}%**")
+        else:
+            st.info("No YES bids available right now")
+
+    except Exception as e:
+        st.error(f"Error fetching {ticker}: {e}")
