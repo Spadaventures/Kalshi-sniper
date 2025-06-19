@@ -1,17 +1,25 @@
-import re, json, threading
-import numpy as np, requests, streamlit as st, websocket
+# streamlit_app.py
+
+import re
+import json
+import threading
+
+import numpy as np
+import requests
+import streamlit as st
+import websocket  # pip install websocket-client
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 st.set_page_config("Live 3-City Temp Sniper", layout="wide")
 
-# Parent-market URLs (exactly as you pasted)
+# The three parent pages you gave me
 PARENT_URLS = {
     "LA":    "https://kalshi.com/markets/kxhighlax/highest-temperature-in-los-angeles#kxhighlax-25jun19",
     "NYC":   "https://kalshi.com/markets/kxhighny/highest-temperature-in-nyc#kxhighny-25jun19",
     "MIAMI": "https://kalshi.com/markets/kxhighmia/highest-temperature-in-miami#kxhighmia-25jun19",
 }
 
-# Coords for ensemble confidence
+# Coordinates for ensemble confidence
 COORDS = {
     "LA":    (33.9425,  -118.4081),
     "NYC":   (40.7812,   -73.9665),
@@ -20,50 +28,40 @@ COORDS = {
 
 WS_URL = "wss://stream.kalshi.com/v1/feed"
 
-# In‐memory stores
+# In-memory stores
 if "outcome_slugs" not in st.session_state:
     st.session_state["outcome_slugs"] = {}
 if "live_yes" not in st.session_state:
     st.session_state["live_yes"] = {}
 
-# ── DISCOVER OUTCOME SLUGS ──────────────────────────────────────────────────────
+# ── 1) Discover each page’s 3 outcome-slugs ─────────────────────────────────────
 def discover_outcomes(url):
-    """
-    Fetch the parent URL HTML and regex out all <a href="/markets/SLUG"> links,
-    then filter for those starting with the parent-slug + '-'.
-    """
-    parent_slug = url.split("/markets/")[1].split("#")[0]
-    html = requests.get(url, timeout=5).text
+    parent = url.split("/markets/")[1].split("#")[0]
+    html   = requests.get(url, timeout=5).text
     candidates = set(re.findall(r'href="/markets/([^"/]+)"', html))
-    outcomes  = sorted(
-        s for s in candidates
-        if s.startswith(parent_slug + "-")
-    )
-    # init live_yes storage
-    for s in outcomes:
+    # pick only those starting with the parent slug + '-'
+    slugs = sorted(s for s in candidates if s.startswith(parent + "-"))
+    for s in slugs:
         st.session_state["live_yes"].setdefault(s, 0.0)
-    return outcomes
+    return slugs
 
-# perform discovery once
 for code, url in PARENT_URLS.items():
     if code not in st.session_state["outcome_slugs"]:
         st.session_state["outcome_slugs"][code] = discover_outcomes(url)
 
-
-# ── WEBSOCKET HANDLER ──────────────────────────────────────────────────────────
+# ── 2) WebSocket → live YES% for each outcome slug ──────────────────────────────
 def on_message(ws, message):
     msg = json.loads(message)
     if msg.get("channel") == "prices" and "market" in msg and "yes" in msg:
         st.session_state["live_yes"][msg["market"]] = float(msg["yes"])
 
 def on_open(ws):
-    # subscribe to every discovered slug
     for slugs in st.session_state["outcome_slugs"].values():
         for slug in slugs:
             ws.send(json.dumps({
-                "action":    "subscribe",
-                "channel":   "prices",
-                "market":    slug
+                "action":  "subscribe",
+                "channel": "prices",
+                "market":  slug
             }))
 
 def run_ws():
@@ -72,20 +70,21 @@ def run_ws():
 
 threading.Thread(target=run_ws, daemon=True).start()
 
-
-# ── ENSEMBLE CONFIDENCE ────────────────────────────────────────────────────────
+# ── 3) Compute a physics-based confidence score ──────────────────────────────────
 def fetch_confidence(code):
     lat, lon = COORDS[code]
     try:
-        resp = requests.get(
+        r = requests.get(
             "https://ensemble-api.open-meteo.com/v1/ensemble",
             params={
                 "latitude":lat, "longitude":lon,
                 "models":"gfs_ensemble_seamless,ecmwf_ifs_025",
-                "daily":"temperature_2m_max","forecast_days":1,"timezone":"auto"
+                "daily":"temperature_2m_max",
+                "forecast_days":1,
+                "timezone":"auto"
             }, timeout=5
         ).json()
-        temps = resp["daily"]["temperature_2m_max"]
+        temps = r["daily"]["temperature_2m_max"]
     except Exception:
         ow = requests.get(
             f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}"
@@ -101,26 +100,35 @@ def fetch_confidence(code):
     raw    = 50 + (avg - 75)*3 - spread*2
     return float(np.clip(raw, 10, 99))
 
-
-# ── DASHBOARD ─────────────────────────────────────────────────────────────────
+# ── 4) Dashboard ────────────────────────────────────────────────────────────────
 st.title("🌡️ Live 3-City Temp Sniper")
 
 for code, slugs in st.session_state["outcome_slugs"].items():
     st.subheader(code)
 
-    # build table of outcome vs live YES%
+    if not slugs:
+        st.info("No outcomes found on this page.")
+        continue
+
+    # Gather live YES% for each slug
     yes_vals = [st.session_state["live_yes"].get(s, 0.0) for s in slugs]
+
+    # Display table
     st.table({
-        "Range":      slugs,
-        "Live YES %": [f"{v:.1f}%" for v in yes_vals]
+        "Range (slug)": slugs,
+        "Live YES %":   [f"{v:.1f}%" for v in yes_vals]
     })
 
-    # pick the one with max YES
-    idx, best = int(np.argmax(yes_vals)), max(yes_vals)
-    best_slug  = slugs[idx]
+    # Pick the index of the max YES%
+    best_idx = max(range(len(yes_vals)), key=lambda i: yes_vals[i])
+    best_slug = slugs[best_idx]
+    best_yes  = yes_vals[best_idx]
 
+    # Your confidence signal
     conf = fetch_confidence(code)
-    if best > conf:
-        st.markdown(f"👉 **Back `{best_slug}`** at **{best:.1f}%** (conf {conf:.1f}%)")
+
+    # Recommendation
+    if best_yes > conf:
+        st.markdown(f"👉 **Back `{best_slug}`** at **{best_yes:.1f}%** (conf {conf:.1f}%)")
     else:
-        st.markdown(f"❌ No edge: best `{best_slug}` @ {best:.1f}% vs conf {conf:.1f}%")
+        st.markdown(f"❌ No edge: best `{best_slug}` @ {best_yes:.1f}% vs conf {conf:.1f}%")
